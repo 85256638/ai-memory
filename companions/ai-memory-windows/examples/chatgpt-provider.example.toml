@@ -1,0 +1,4 @@
+# Copy to the installed ops/chatgpt-provider.toml and select an available model.
+llm_provider = "openai-oauth"
+llm_model = "REPLACE_WITH_AVAILABLE_MODEL"
+llm_reasoning_effort = "medium"

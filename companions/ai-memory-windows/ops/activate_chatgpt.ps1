@@ -1,0 +1,1 @@
+$ErrorActionPreference='Stop'; . (Join-Path $PSScriptRoot 'windows_paths.ps1'); & $memoryPython (Join-Path $PSScriptRoot 'activate_chatgpt.py'); if ($LASTEXITCODE -ne 0) { throw 'ChatGPT provider switch failed; check the diagnostic result above.' }

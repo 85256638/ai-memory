@@ -1,0 +1,34 @@
+name: Windows companion
+
+on:
+  push:
+    branches: [windows-customized]
+    paths:
+      - companions/ai-memory-windows/**
+      - .github/workflows/windows-companion.yml
+  pull_request:
+    paths:
+      - companions/ai-memory-windows/**
+      - .github/workflows/windows-companion.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  companion:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Parse PowerShell sources
+        shell: powershell
+        run: $memoryErrors=@(); Get-ChildItem -LiteralPath 'companions/ai-memory-windows' -Recurse -Filter '*.ps1' | ForEach-Object { $memoryTokens=$null; $memoryParseErrors=$null; $null=[Management.Automation.Language.Parser]::ParseFile($_.FullName,[ref]$memoryTokens,[ref]$memoryParseErrors); $memoryErrors+=@($memoryParseErrors) }; if ($memoryErrors.Count) { $memoryErrors | Format-List; exit 1 }
+      - name: Build the tray from source
+        shell: powershell
+        run: $memoryCompiler=Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'; & $memoryCompiler /nologo /target:winexe /codepage:65001 ('/out:'+(Join-Path $env:RUNNER_TEMP 'AI-Memory-Status.exe')) /reference:System.dll /reference:System.Core.dll /reference:System.Drawing.dll /reference:System.Windows.Forms.dll /reference:System.Web.Extensions.dll 'companions/ai-memory-windows/ops/AI-Memory-Status.cs'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Run isolated companion regressions
+        shell: powershell
+        run: python -m unittest discover -s 'companions/ai-memory-windows/tests' -v

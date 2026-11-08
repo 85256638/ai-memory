@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 220" width="1120" height="220" role="img" aria-labelledby="title desc">
+  <title id="title">AI Memory Windows tray status legend</title>
+  <desc id="desc">Illustrative states: green healthy, amber needs attention, red failed, grey maintenance. No real device data.</desc>
+  <rect width="1120" height="220" rx="18" fill="#f3f5f7"/>
+  <g font-family="Segoe UI,Arial,sans-serif">
+    <text x="34" y="38" font-size="20" font-weight="600" fill="#17212b">AI Memory · Windows tray</text>
+    <text x="34" y="66" font-size="14" fill="#526170">Illustration from source · no live device data</text>
+    <g transform="translate(70 125)">
+      <circle r="27" fill="#1daa5b"/><text y="8" text-anchor="middle" fill="white" font-size="27" font-weight="700">M</text>
+      <text x="43" y="-4" fill="#17212b" font-size="17" font-weight="600">Healthy</text>
+      <text x="43" y="22" fill="#526170" font-size="13">Recent full check OK</text>
+    </g>
+    <g transform="translate(345 125)">
+      <circle r="27" fill="#e19f18"/><text y="8" text-anchor="middle" fill="white" font-size="27" font-weight="700">M</text>
+      <text x="43" y="-4" fill="#17212b" font-size="17" font-weight="600">Attention</text>
+      <text x="43" y="22" fill="#526170" font-size="13">Check details / freshness</text>
+    </g>
+    <g transform="translate(620 125)">
+      <circle r="27" fill="#da363d"/><text y="8" text-anchor="middle" fill="white" font-size="27" font-weight="700">M</text>
+      <text x="43" y="-4" fill="#17212b" font-size="17" font-weight="600">Failed</text>
+      <text x="43" y="22" fill="#526170" font-size="13">Offline or check failed</text>
+    </g>
+    <g transform="translate(895 125)">
+      <circle r="27" fill="#707c8b"/><text y="8" text-anchor="middle" fill="white" font-size="27" font-weight="700">M</text>
+      <text x="43" y="-4" fill="#17212b" font-size="17" font-weight="600">Maintenance</text>
+      <text x="43" y="22" fill="#526170" font-size="13">Auto-repair paused</text>
+    </g>
+    <text x="34" y="195" font-size="13" fill="#526170">Tray polls every 15 seconds · health watch runs every 5 minutes · full check becomes stale after 10 minutes</text>
+  </g>
+</svg>

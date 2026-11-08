@@ -1,0 +1,6 @@
+# Copy to the installed ops/relay-provider.toml and enter your own endpoint/model.
+# Keep the API key in the private ops/relay-api-key.txt file, never in this file.
+llm_provider = "openai-compat"
+llm_base_url = "https://relay.example.com/v1"
+llm_model = "REPLACE_WITH_AVAILABLE_MODEL"
+llm_reasoning_effort = "medium"

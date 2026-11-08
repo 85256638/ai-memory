@@ -1,0 +1,1 @@
+$ErrorActionPreference='Stop'; . (Join-Path $PSScriptRoot 'windows_paths.ps1'); & $memoryPython (Join-Path $PSScriptRoot 'activate_relay.py') @args; if ($LASTEXITCODE -ne 0) { throw 'Relay activation did not complete; see the result above.' }

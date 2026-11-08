@@ -26,6 +26,20 @@ the legitimate restricted-project control and the failed-query cases.
 
 ## Boundary map
 
+### Optional Windows companion in this fork
+
+The upstream boundaries below are unchanged. The optional
+`companions/ai-memory-windows` layer has these additional guards:
+
+| Boundary | Enforcing code | Adversarial tests | Scope |
+| --- | --- | --- | --- |
+| Relay credentials stay on the configured route | `llm_task_diagnostics.upstream_base`, gateway `Handler`, `NoRedirect`, route digest | `test_gateway.py` attempts a bad bearer, arbitrary route, oversized body, HTTP redirect and changed destination, with an authorized forwarding control; `test_portability.py` refuses non-HTTPS URLs, embedded credentials and query secrets | Local companion only |
+| Image repair keeps event identity and original bytes | `spool_image_guard.compact_entry`, `repair_oversized_images` | `test_spool_image_guard.py` refuses remote/profile events, unknown image shapes and concurrent writers; confirms scope/auth preservation and byte-identical backup | Default loopback Codex spool |
+| Backup verification never extracts archive paths | `upgrade_snapshot.verify_core` | `test_portability.py` includes a traversal member alongside a legitimate SQLite member and verifies that no traversal file is created | Local private snapshots |
+| Portable archive paths do not admit unrelated files | `windows_paths.archive_name`, `read_settings` | `test_portability.py` rejects relative settings and files outside the configured roots, with custom-path controls | Local companion paths |
+
+### Upstream boundaries
+
 | # | Boundary | Enforcing code | Adversarial test(s) | Coverage |
 |---|----------|----------------|---------------------|----------|
 | 0a | A generated DSH hook config cannot expose or redirect an embedded server bearer | `ai-memory-cli/src/commands/install_hooks.rs` `write_private_dsh_config` creates `hooks.json` owner-only before writing, resets a pre-existing file to `0600`, and refuses a final-component symlink | `install_hooks.rs` `apply_to_dsh_keeps_an_embedded_bearer_owner_only` (a world-readable predecessor becomes private before the new bearer is written; the bearer control is present), `apply_to_dsh_refuses_a_symlinked_hook_config` (an attempted redirect is refused and its target stays byte-identical) | STRONG on Unix; Windows protection remains the data directory ACL |

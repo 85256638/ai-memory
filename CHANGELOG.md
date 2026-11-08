@@ -11,6 +11,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Added
+
+- Added an optional Windows companion in this fork: a four-state tray,
+  scheduled health checks, verified private backups, an upgrade wrapper,
+  oversized image-spool protection and configurable provider helpers.
+  See [the companion guide](companions/ai-memory-windows/README.md).
+  The upstream Rust server remains at v3.4.3.
+
 ## [3.4.3] - 2026-11-06
 
 ### Changed
