@@ -1398,18 +1398,37 @@ fn finish(
     }
     if report.skipped_not_admitted {
         println!(
-            "{}", i18n.format("cli-backfill-ai-memory-capture-mode-is-allowlist-and-this-checkout-has-no-ai-memory-toml", &[("value0", report.workspace.to_string()), ("value1", report.project.to_string())]));
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-backfill-ai-memory-capture-mode-is-allowlist-and-this-checkout-has-no-ai-memory-toml",
+                &[
+                    ("value0", report.workspace.to_string()),
+                    ("value1", report.project.to_string())
+                ]
+            )
+        );
         return Ok(());
     }
     if report.skipped_non_empty {
         println!(
-            "{}", i18n.format("cli-backfill-ai-memory-already-has-captured-sessions-nothing-to-backfill-use-force-to-imp", &[("value0", report.workspace.to_string()), ("value1", report.project.to_string())]));
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-backfill-ai-memory-already-has-captured-sessions-nothing-to-backfill-use-force-to-imp",
+                &[
+                    ("value0", report.workspace.to_string()),
+                    ("value1", report.project.to_string())
+                ]
+            )
+        );
         return Ok(());
     }
     if report.dry_run {
         println!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-backfill-ai-memory-would-import-local-session-s-into-dry-run",
                 &[
                     ("value0", format!("{}", report.selected)),
@@ -1423,7 +1442,8 @@ fn finish(
     if report.imported_sessions == 0 && report.failed_sessions == 0 {
         println!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-backfill-ai-memory-no-local-session-history-found-to-backfill-for",
                 &[
                     ("value0", report.workspace.to_string()),
@@ -1963,13 +1983,17 @@ mod tests {
             ingest_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
             ingest_gates: IngestGates::default(),
             session_agents: SessionAgents::default(),
+            project_briefs: ai_memory_hooks::ProjectBriefs::default(),
             cwd_probes: CwdProbes::default(),
             ingest_rate: Arc::new(tokio::sync::Mutex::new(IngestRateLimiter::disabled())),
             consolidate_on_session_end: false,
             session_consolidation_notify: None,
             profile_notify: None,
             capture_assistant_enabled: false,
+            assistant_excerpt_max_bytes: ai_memory_hooks::ASSISTANT_EXCERPT_MAX_BYTES,
             claim_handoff_on_session_start: true,
+            deliver_handoff_on_session_start: true,
+            deliver_recovery_on_session_start: true,
             create_handoff_on_session_end: false,
             subagent_sessions: Arc::new(tokio::sync::Mutex::new(SubagentSessionSet::default())),
             home_dir: None,
@@ -2168,13 +2192,17 @@ mod tests {
             ingest_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
             ingest_gates: IngestGates::default(),
             session_agents: SessionAgents::default(),
+            project_briefs: ai_memory_hooks::ProjectBriefs::default(),
             cwd_probes: CwdProbes::default(),
             ingest_rate: Arc::new(tokio::sync::Mutex::new(IngestRateLimiter::disabled())),
             consolidate_on_session_end: false,
             session_consolidation_notify: None,
             profile_notify: None,
             capture_assistant_enabled: false,
+            assistant_excerpt_max_bytes: ai_memory_hooks::ASSISTANT_EXCERPT_MAX_BYTES,
             claim_handoff_on_session_start: true,
+            deliver_handoff_on_session_start: true,
+            deliver_recovery_on_session_start: true,
             create_handoff_on_session_end: false,
             subagent_sessions: Arc::new(tokio::sync::Mutex::new(SubagentSessionSet::default())),
             home_dir: None,

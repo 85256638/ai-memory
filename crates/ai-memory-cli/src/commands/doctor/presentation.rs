@@ -9,7 +9,8 @@ pub(super) fn render(report: &DoctorReport, terminal: &crate::terminal::Terminal
     terminal.section(&i18n.text("cli-presentation-connection"));
     terminal.line(format_args!(
         "{}",
-        i18n.format(
+        crate::localization::format(
+            i18n,
             "cli-presentation-capture-coverage-for-server",
             &[
                 ("value0", report.workspace.to_string()),
@@ -90,6 +91,19 @@ pub(super) fn render(report: &DoctorReport, terminal: &crate::terminal::Terminal
 
     if let Some(problem) = &report.windows_logon {
         terminal.line(format_args!("{}", problem.render_human()));
+    }
+
+    if let Some(shared) = &report.data_dir_shared {
+        terminal.line(format_args!(
+            "{}",
+            i18n.format(
+                "cli-doctor-shared-data-dir",
+                &[
+                    ("path", terminal_text(&shared.path)),
+                    ("mode", shared.mode.clone())
+                ]
+            )
+        ));
     }
 
     if let Some(problem) = &report.marker_capture_problem {

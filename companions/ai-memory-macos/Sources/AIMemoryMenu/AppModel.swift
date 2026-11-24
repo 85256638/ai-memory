@@ -20,9 +20,10 @@ final class AppModel {
     var lastHTTPStatus: Int?
 
     @ObservationIgnored private var tokenStore: any TokenStore
-    @ObservationIgnored private var health = HealthClient()
+    @ObservationIgnored private let fetchHealth: @Sendable (URL, String?) async throws -> StatusReport
     @ObservationIgnored private var runner: any CommandRunning
     @ObservationIgnored private var pollTask: Task<Void, Never>?
+    @ObservationIgnored private var latestPoll: UUID?
     @ObservationIgnored private var fetchFailed = false
     @ObservationIgnored private var startingDeadline: Date?
     @ObservationIgnored private var logFreshSince = Date()
@@ -30,14 +31,32 @@ final class AppModel {
     init(
         settings: AppSettings = .load(),
         tokenStore: any TokenStore = KeychainTokenStore(),
-        runner: any CommandRunning = ProcessRunner()
+        runner: any CommandRunning = ProcessRunner(),
+        fetchHealth: @escaping @Sendable (URL, String?) async throws -> StatusReport = HealthClient().fetch,
+        pollAutomatically: Bool = true
     ) {
         self.settings = settings
         self.tokenStore = tokenStore
         self.runner = runner
+        self.fetchHealth = fetchHealth
         self.tokenConfigured = tokenStore.read()?.isEmpty == false
         self.dataDirTokenPresent = DataDirToken.read(dataDir: settings.resolvedDataDir) != nil
-        startPolling()
+        // A token saved by an earlier version has no recorded origin. Bind it
+        // to the server configured at first launch, where it was already being
+        // sent, so the upgrade keeps working until a later URL change. But a
+        // token left unbound by a failed clear after a failed save is a stale
+        // bearer that must stay unbound and unsent, not be adopted onto the
+        // current server (GHSA-xj78 follow-up, #2289).
+        if self.tokenConfigured,
+           self.settings.tokenOrigin == nil,
+           !self.settings.pendingClearFailed
+        {
+            self.settings.adoptUnboundToken()
+            self.settings.save()
+        }
+        if pollAutomatically {
+            startPolling()
+        }
     }
 
     var headlineVersion: String {
@@ -74,7 +93,27 @@ final class AppModel {
     }
 
     private var effectiveToken: String? {
-        DataDirToken.effective(saved: tokenStore.read(), dataDir: dataDir)
+        DataDirToken.effective(
+            saved: tokenStore.read(),
+            savedOrigin: settings.tokenOrigin,
+            serverURL: settings.serverURL,
+            dataDir: dataDir
+        )
+    }
+
+    /// True when a token is saved but belongs to a different server than the
+    /// one now configured, so it is not being sent. Drives the Settings caption
+    /// and keeps "Clear saved token" available.
+    var savedTokenIsForAnotherServer: Bool {
+        guard tokenStore.read()?.isEmpty == false else {
+            return false
+        }
+        guard let origin = settings.tokenOrigin,
+              let target = ServerOrigin.of(settings.serverURL)
+        else {
+            return true
+        }
+        return origin != target
     }
 
     var dataDir: URL {
@@ -102,14 +141,26 @@ final class AppModel {
     }
 
     func poll() async {
-        let controller = launchdController()
-        launchd = controller.state()
-        lastHTTPStatus = nil
+        let pollID = UUID()
+        latestPoll = pollID
+        launchd = launchdController().state()
+        let result: Result<StatusReport, any Error>
         do {
-            report = try await health.fetch(baseURL: settings.serverURL, token: effectiveToken)
+            result = .success(try await fetchHealth(settings.serverURL, effectiveToken))
+        } catch {
+            result = .failure(error)
+        }
+        // A settings or lifecycle action can refresh while the background
+        // poll is suspended. Only the latest request can publish its state.
+        guard latestPoll == pollID, !Task.isCancelled else { return }
+
+        lastHTTPStatus = nil
+        switch result {
+        case .success(let fetched):
+            report = fetched
             fetchFailed = false
             lastError = nil
-        } catch {
+        case .failure(let error):
             report = nil
             fetchFailed = true
             if let health = error as? HealthError, case let .http(code) = health {
@@ -192,19 +243,12 @@ final class AppModel {
         await runBusy {
             let controller = self.launchdController()
             let runtime = try self.requireRuntime()
-            let installed = (try? String(contentsOf: controller.plistDestination, encoding: .utf8)) ?? ""
-            if LaunchdController.programArgumentsBinary(inPlist: installed) != runtime.binary.path {
-                try? controller.bootout()
-                let template = try String(contentsOf: runtime.plistTemplate, encoding: .utf8)
-                try controller.writePlist(
-                    template: template,
-                    binary: runtime.binary,
-                    dataDir: self.settings.dataDirOverride
-                )
-                try controller.bootstrap()
-            } else {
-                try controller.kickstart()
-            }
+            let template = try String(contentsOf: runtime.plistTemplate, encoding: .utf8)
+            try controller.restart(
+                template: template,
+                binary: runtime.binary,
+                dataDir: self.settings.dataDirOverride
+            )
         }
         clearStartingIfFailed()
         await poll()
@@ -244,21 +288,20 @@ final class AppModel {
         token: String?,
         clearToken: Bool
     ) {
-        if let url = URL(string: serverURLString), url.scheme != nil {
-            settings.serverURL = url
+        settings.applyEdit(
+            serverURLString: serverURLString,
+            dataDirOverride: dataDirOverride,
+            tokenInEdit: clearToken ? nil : token
+        )
+        // The keychain write and the binding are committed together: a failed
+        // write must not leave the retained old bearer bound and resent.
+        if settings.commitTokenEdit(clearToken: clearToken, token: token, to: tokenStore) != nil {
+            lastError = "Couldn't update the saved token in the keychain. "
+                + "Re-check the bearer in Settings."
         }
-        let trimmed = dataDirOverride.trimmingCharacters(in: .whitespacesAndNewlines)
-        settings.dataDirOverride = trimmed.isEmpty ? nil : URL(fileURLWithPath: trimmed)
         settings.save()
-        if clearToken {
-            try? tokenStore.clear()
-        } else if let token {
-            let value = token.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !value.isEmpty {
-                try? tokenStore.save(value)
-            }
-        }
         tokenConfigured = tokenStore.read()?.isEmpty == false
+        latestPoll = nil
         Task { await poll() }
     }
 
@@ -268,6 +311,7 @@ final class AppModel {
         icon = .starting
         report = nil
         lastError = nil
+        latestPoll = nil
         pollTask?.cancel()
         pollTask = nil
         startPolling()
@@ -314,7 +358,9 @@ final class AppModel {
         }
     }
 
-    private static func describe(_ error: HealthError) -> String {
+    // Pure formatting; nonisolated so the `.map(Self.describe)` in the start
+    // path type-checks under Swift 6.0 (Xcode 16.2), not only newer compilers.
+    private nonisolated static func describe(_ error: HealthError) -> String {
         switch error {
         case .badURL:
             "Invalid server URL"

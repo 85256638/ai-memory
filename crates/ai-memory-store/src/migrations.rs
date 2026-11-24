@@ -10,7 +10,7 @@ refinery::embed_migrations!("migrations");
 /// `testdata/V62__page_ingestion_windows.pre776.sql`; a regression test
 /// derives this value through refinery's own checksum implementation.
 const ORIGINAL_V62_CHECKSUM: u64 = 16_518_128_245_137_964_566;
-const V62_VERSION: u32 = 62;
+const V62_VERSION: i32 = 62;
 const V62_NAME: &str = "page_ingestion_windows";
 
 /// Run all pending migrations against an open connection.
@@ -111,14 +111,14 @@ fn crlf_checksum(migration: &refinery::Migration) -> Option<u64> {
     ))
 }
 
-fn checksum_for_sql(version: u32, name: &str, sql: &str) -> u64 {
+fn checksum_for_sql(version: i32, name: &str, sql: &str) -> u64 {
     refinery::Migration::unapplied(&format!("V{version}__{name}"), sql)
         .expect("embedded migration identity must remain valid")
         .checksum()
 }
 
 /// Highest schema version baked into this binary (the max embedded migration).
-fn max_supported_version() -> u32 {
+fn max_supported_version() -> i32 {
     migrations::runner()
         .get_migrations()
         .iter()
@@ -141,7 +141,8 @@ fn classify_run_error(err: refinery::Error) -> StoreError {
         if migration.version() > supported {
             return StoreError::DataSchemaAhead {
                 applied: identity,
-                supported,
+                supported: u32::try_from(supported)
+                    .expect("embedded migration version is non-negative"),
             };
         }
     }
@@ -149,7 +150,7 @@ fn classify_run_error(err: refinery::Error) -> StoreError {
 }
 
 #[cfg(test)]
-pub(crate) fn run_to(conn: &mut rusqlite::Connection, target: u32) -> Result<(), refinery::Error> {
+pub(crate) fn run_to(conn: &mut rusqlite::Connection, target: i32) -> Result<(), refinery::Error> {
     migrations::runner()
         .set_target(refinery::Target::Version(target))
         .run(conn)?;
@@ -354,7 +355,7 @@ mod tests {
             selection: crate::WorkstreamSelection::Named("default".into()),
             lease_owner: "host:2".into(),
         };
-        assert!(crate::workstream::prepare_run(&mut conn, &input, None, true).is_err());
+        assert!(crate::workstream::prepare_run(&mut conn, &input, None, true, false).is_err());
         assert_eq!(
             snapshot(&conn),
             ("active".into(), 3, 7, true, false),
@@ -365,7 +366,8 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1);
         conn.execute_batch("DROP TRIGGER reject_new_run;").unwrap();
-        let prepared = crate::workstream::prepare_run(&mut conn, &input, None, true).unwrap();
+        let prepared =
+            crate::workstream::prepare_run(&mut conn, &input, None, true, false).unwrap();
         let pinned: bool = conn
             .query_row(
                 "SELECT scope_by_id FROM managed_runs WHERE id = ?1",
@@ -407,7 +409,7 @@ mod tests {
             StoreError::DataSchemaAhead { applied, supported } => {
                 assert!(applied.contains(&format!("V{future}")), "applied={applied}");
                 assert!(applied.contains("future_feature"), "applied={applied}");
-                assert_eq!(supported, max_supported_version());
+                assert_eq!(i32::try_from(supported).unwrap(), max_supported_version());
             }
             other => panic!("expected DataSchemaAhead, got: {other:?}"),
         }
@@ -765,6 +767,7 @@ mod tests {
                 body: "continue".into(),
                 importance: 8,
                 file_path: None,
+                trust_class: None,
             },
         )
         .unwrap();
@@ -956,6 +959,7 @@ mod tests {
                 agent_kind: AgentKind::Hermes,
                 cwd: Some("/repo".into()),
                 actor_user: Some("user:alice".into()),
+                origin: None,
             },
         )
         .unwrap();
@@ -1015,6 +1019,7 @@ mod tests {
                 agent_kind: AgentKind::KiroCli,
                 cwd: Some("/repo".into()),
                 actor_user: Some("user:alice".into()),
+                origin: None,
             },
         )
         .unwrap();
@@ -1088,6 +1093,7 @@ mod tests {
                 agent_kind: AgentKind::CommandCode,
                 cwd: Some("/repo".into()),
                 actor_user: Some("user:alice".into()),
+                origin: None,
             },
         )
         .unwrap();
@@ -1161,6 +1167,7 @@ mod tests {
                 agent_kind: AgentKind::Pool,
                 cwd: Some("/repo".into()),
                 actor_user: Some("user:alice".into()),
+                origin: None,
             },
         )
         .unwrap();
@@ -1229,6 +1236,7 @@ mod tests {
                 agent_kind: AgentKind::Zcode,
                 cwd: Some("/repo".into()),
                 actor_user: Some("user:alice".into()),
+                origin: None,
             },
         )
         .unwrap();
@@ -1330,6 +1338,7 @@ mod tests {
                 agent_kind: AgentKind::Grizzybot,
                 cwd: Some("/repo".into()),
                 actor_user: Some("user:alice".into()),
+                origin: None,
             },
         )
         .unwrap();
@@ -1403,6 +1412,7 @@ mod tests {
                 agent_kind: AgentKind::CopilotCli,
                 cwd: Some("/repo".into()),
                 actor_user: Some("user:alice".into()),
+                origin: None,
             },
         )
         .unwrap();
@@ -1492,6 +1502,7 @@ mod tests {
                 agent_kind: AgentKind::Droid,
                 cwd: Some("/repo".into()),
                 actor_user: Some("user:alice".into()),
+                origin: None,
             },
         )
         .unwrap();
@@ -1614,6 +1625,7 @@ mod tests {
                 agent_kind: AgentKind::Muse,
                 cwd: Some("/repo".into()),
                 actor_user: Some("user:alice".into()),
+                origin: None,
             },
         )
         .unwrap();
@@ -1736,6 +1748,7 @@ mod tests {
                 agent_kind: AgentKind::CodeBuddy,
                 cwd: Some("/repo".into()),
                 actor_user: Some("user:alice".into()),
+                origin: None,
             },
         )
         .unwrap();
@@ -1843,6 +1856,7 @@ mod tests {
                 agent_kind: AgentKind::IbmBob,
                 cwd: Some("/repo".into()),
                 actor_user: Some("user:alice".into()),
+                origin: None,
             },
         )
         .unwrap();
@@ -1952,6 +1966,7 @@ mod tests {
                 agent_kind: AgentKind::QwenCode,
                 cwd: Some("/repo".into()),
                 actor_user: Some("user:alice".into()),
+                origin: None,
             },
         )
         .unwrap();
@@ -2043,6 +2058,7 @@ mod tests {
                 agent_kind: AgentKind::Qoder,
                 cwd: Some("/repo".into()),
                 actor_user: Some("user:alice".into()),
+                origin: None,
             },
         )
         .unwrap();
@@ -2056,6 +2072,153 @@ mod tests {
         for name in [
             "idx_sessions_open_owner",
             "sessions_ws_proj_pairing_ai",
+            "auto_improve_scheduler_claims_session_pairing_ai",
+            "session_consolidation_jobs_session_pairing_ai",
+        ] {
+            let kind = if name.starts_with("idx_") {
+                "index"
+            } else {
+                "trigger"
+            };
+            assert_eq!(schema_object_count(&conn, kind, name), 1, "missing {name}");
+        }
+    }
+
+    /// V107 expands the persisted session kind again, for WorkBuddy, without
+    /// losing the session graph or the rows that reference it.
+    #[test]
+    fn v106_to_v107_preserves_sessions_and_accepts_workbuddy() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 106).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        let workspace_id = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
+        let project_id =
+            crate::ops::get_or_create_project(&mut conn, &workspace_id, "project", None).unwrap();
+        let existing = SessionId::new();
+        conn.execute(
+            "INSERT INTO sessions \
+             (id, workspace_id, project_id, agent_kind, cwd, started_at, ended_at, \
+              ended_observation_count, actor_user, display_name, display_name_updated_ns) \
+             VALUES (?1, ?2, ?3, 'qoder', '/repo', 1, 2, 7, 'user:alice', 'named', 99)",
+            params![
+                existing.as_bytes(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+            ],
+        )
+        .unwrap();
+        // V106 cannot store a WorkBuddy session yet.
+        assert!(
+            conn.execute(
+                "INSERT INTO sessions \
+                 (id, workspace_id, project_id, agent_kind, started_at) \
+                 VALUES (?1, ?2, ?3, 'workbuddy', 1)",
+                params![
+                    SessionId::new().as_bytes(),
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                ],
+            )
+            .is_err(),
+            "the V106 CHECK must reject workbuddy"
+        );
+        conn.execute(
+            "INSERT INTO ingest_keys (project_id, key, seen_at, session_id, agent_kind) \
+             VALUES (?1, 'k1', 1, ?2, 'qoder')",
+            params![project_id.as_bytes(), existing.as_bytes()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO observations \
+             (id, session_id, workspace_id, project_id, kind, title, body, created_at) \
+             VALUES (?1, ?2, ?3, ?4, 'prompt', 'kept', 'kept body', 1)",
+            params![
+                uuid::Uuid::new_v4().as_bytes(),
+                existing.as_bytes(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+            ],
+        )
+        .unwrap();
+
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        run(&mut conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        let preserved: (
+            String,
+            String,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+        ) = conn
+            .query_row(
+                "SELECT agent_kind, cwd, ended_observation_count, actor_user, \
+                 display_name, display_name_updated_ns \
+                 FROM sessions WHERE id = ?1",
+                params![existing.as_bytes()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            preserved,
+            (
+                "qoder".into(),
+                "/repo".into(),
+                7,
+                Some("user:alice".into()),
+                Some("named".into()),
+                Some(99)
+            )
+        );
+        let observations: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM observations WHERE session_id = ?1",
+                params![existing.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(observations, 1, "the session's observations survive");
+        for table in ["ingest_keys", "observations"] {
+            let dangling: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM pragma_foreign_key_check('{table}')"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(dangling, 0, "{table} must still reference sessions");
+        }
+
+        crate::ops::begin_session(
+            &mut conn,
+            &NewSession {
+                occurred_at: None,
+                id: SessionId::new(),
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::WorkBuddy,
+                cwd: Some("/repo".into()),
+                actor_user: Some("user:alice".into()),
+                origin: None,
+            },
+        )
+        .unwrap();
+
+        for name in [
+            "idx_sessions_open_owner",
+            "sessions_ws_proj_pairing_ai",
+            "sessions_clear_display_name_on_scope_change",
             "auto_improve_scheduler_claims_session_pairing_ai",
             "session_consolidation_jobs_session_pairing_ai",
         ] {
@@ -2088,6 +2251,7 @@ mod tests {
                 agent_kind: AgentKind::Codex,
                 cwd: Some("/repo".into()),
                 actor_user: Some("user:alice".into()),
+                origin: None,
             },
         )
         .unwrap();
@@ -2511,6 +2675,7 @@ mod tests {
                 agent_kind: AgentKind::Codex,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -2526,6 +2691,7 @@ mod tests {
             body: body.into(),
             importance: 5,
             file_path: None,
+            trust_class: None,
         };
         let body = "edited crates/ai-memory-store/src/reader.rs in ai-memory";
         let page = [4_u8; 16];
@@ -2559,7 +2725,13 @@ mod tests {
             assert_eq!(matches(&conn, table, "reader.rs"), 0, "{table} at V96");
         }
 
+        // The chain now ends with a `sessions` rebuild. `Store::open` turns
+        // foreign keys off around the runner; a direct caller must do the
+        // same or the rebuild's `DROP TABLE sessions` cascades into the
+        // observations this test is about to search.
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
         run(&mut conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
 
         for table in TABLES {
             for raw in ["reader.rs", "reader", "src/reader.rs", "ai-memory"] {
@@ -2601,6 +2773,7 @@ mod tests {
                 agent_kind: AgentKind::Codex,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -2633,6 +2806,7 @@ mod tests {
                 body: BODY.into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
         )
         .unwrap();
@@ -2663,7 +2837,11 @@ mod tests {
             assert_eq!(v100_matches(&conn, table, "alpha"), 0, "{table} at V99");
         }
 
+        // A direct `run` caller must turn foreign keys off for the trailing
+        // `sessions` rebuild, as `Store::open` does.
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
         run(&mut conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
 
         for table in V100_TABLES {
             for part in ["alpha", "marker", "zebrafinch", "keeper"] {
@@ -2704,6 +2882,9 @@ mod tests {
         conn.execute("ALTER TABLE observations ADD COLUMN body_parts TEXT", [])
             .unwrap();
 
+        // As in `Store::open`: the trailing `sessions` rebuild must not
+        // cascade into the rows under test.
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
         let err = run(&mut conn).unwrap_err();
         assert!(matches!(err, StoreError::Migration(_)), "{err:?}");
         assert_eq!(applied_versions(&conn).last(), Some(&99));
@@ -2728,6 +2909,7 @@ mod tests {
         conn.execute("ALTER TABLE observations DROP COLUMN body_parts", [])
             .unwrap();
         run(&mut conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         assert_eq!(
             applied_versions(&conn).last(),
             Some(&i64::from(max_supported_version()))
@@ -2762,6 +2944,7 @@ mod tests {
                 agent_kind: AgentKind::Codex,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -2778,7 +2961,11 @@ mod tests {
         )
         .unwrap();
 
+        // A direct `run` caller must turn foreign keys off for the trailing
+        // `sessions` rebuild, as `Store::open` does.
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
         run(&mut conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
 
         let existing: (String, Option<String>) = conn
             .query_row("SELECT body, file_path FROM observations", [], |row| {
@@ -2800,6 +2987,7 @@ mod tests {
                 body: "after V99".into(),
                 importance: 5,
                 file_path: Some("src/lib.rs".into()),
+                trust_class: None,
             },
         )
         .unwrap();
@@ -2812,5 +3000,431 @@ mod tests {
             )
             .unwrap();
         assert!(plan.contains("idx_observations_file_path"), "{plan}");
+    }
+
+    /// V112 adds `page_sources` to a store whose pages were compiled by an
+    /// older build: nothing is backfilled (the session citation in
+    /// `page_evidence` cannot say which observations the prompt carried), the
+    /// existing page and its evidence are untouched, and the next compile of
+    /// that page records its sources.
+    #[test]
+    fn v112_adds_page_sources_without_backfilling_compiled_pages() {
+        use ai_memory_core::{
+            NewPage, PageEvidence, PageEvidenceKind, PagePath, SourceObservations, Tier,
+        };
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 111).unwrap();
+        let workspace_id = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
+        let project_id =
+            crate::ops::get_or_create_project(&mut conn, &workspace_id, "proj", None).unwrap();
+        let session_id = SessionId::new();
+        crate::ops::begin_session(
+            &mut conn,
+            &NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+                origin: None,
+            },
+        )
+        .unwrap();
+        let observation_id = crate::ops::insert_observation(
+            &mut conn,
+            &NewObservation {
+                occurred_at: None,
+                session_id,
+                workspace_id,
+                project_id,
+                kind: ObservationKind::PostToolUse,
+                extension: None,
+                source_event: None,
+                title: "tool".into(),
+                body: "before V112".into(),
+                importance: 5,
+                file_path: None,
+                trust_class: None,
+            },
+        )
+        .unwrap();
+        let compiled = |body: &str, observations: SourceObservations| NewPage {
+            workspace_id,
+            project_id,
+            path: PagePath::new(format!("sessions/{session_id}.md")).unwrap(),
+            title: "session".into(),
+            body: body.into(),
+            tier: Tier::Episodic,
+            frontmatter_json: serde_json::json!({}),
+            pinned: false,
+            links: Vec::new(),
+            author_id: None,
+            expires_at: None,
+            entities: Vec::new(),
+            evidence: vec![PageEvidence {
+                kind: PageEvidenceKind::Session,
+                source_id: session_id.to_string(),
+                observations,
+            }],
+            trust_class: None,
+        };
+        // What the older build wrote: the session citation alone.
+        let old_page =
+            crate::ops::upsert_page(&mut conn, &compiled("old", SourceObservations::Unrecorded))
+                .unwrap();
+
+        // A direct `run` caller must turn foreign keys off for the trailing
+        // `sessions` rebuild, as `Store::open` does.
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        run(&mut conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        let count = |conn: &Connection, sql: &str| -> i64 {
+            conn.query_row(sql, [], |row| row.get(0)).unwrap()
+        };
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM page_sources"), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM page_evidence"), 1);
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM pages WHERE is_latest = 1"),
+            1
+        );
+
+        let new_page = crate::ops::upsert_page(
+            &mut conn,
+            &compiled("new", SourceObservations::Listed(vec![observation_id])),
+        )
+        .unwrap();
+        let recorded: Vec<(Vec<u8>, Vec<u8>)> = conn
+            .prepare("SELECT page_id, observation_id FROM page_sources")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            recorded,
+            vec![(
+                new_page.as_bytes().to_vec(),
+                observation_id.as_bytes().to_vec()
+            )],
+            "the old version {old_page} stays unrecorded"
+        );
+    }
+
+    /// A 3.4.x database (schema at V105, the last migration the 3.4 patch line
+    /// shipped) upgrades cleanly to the 3.5 schema. The seven migrations
+    /// renumbered above V105 for 3.5 apply without a divergent- or
+    /// missing-version abort, and `idx_sessions_open_started` — which V102
+    /// creates and the V107 WorkBuddy table rebuild drops and must recreate —
+    /// survives the upgrade exactly as it exists on a fresh install.
+    #[test]
+    fn v105_database_upgrades_to_current_and_keeps_open_sessions_index() {
+        fn open_sessions_index_present(conn: &Connection) -> bool {
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' \
+                 AND name='idx_sessions_open_started' AND tbl_name='sessions'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+                > 0
+        }
+        let applied_max = |conn: &Connection| -> i32 {
+            conn.query_row(
+                "SELECT MAX(version) FROM refinery_schema_history",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        // Stop at the last migration the 3.4 patch line shipped.
+        let mut upgraded = Connection::open_in_memory().unwrap();
+        run_to(&mut upgraded, 105).unwrap();
+        assert!(
+            open_sessions_index_present(&upgraded),
+            "V102 must create idx_sessions_open_started by V105"
+        );
+
+        // Applying the remaining migrations is the 3.4.x -> 3.5 upgrade. The
+        // frozen V102-V105 checksums must still match (no divergence), the new
+        // V106-V112 must apply, and the sessions rebuild must restore the index.
+        migrations::runner()
+            .set_abort_divergent(true)
+            .set_abort_missing(true)
+            .run(&mut upgraded)
+            .expect("3.4.x -> 3.5 upgrade applies without divergence");
+        assert!(
+            open_sessions_index_present(&upgraded),
+            "V107 WorkBuddy rebuild must recreate idx_sessions_open_started"
+        );
+
+        // A fresh install reaches the same schema with the same index.
+        let mut fresh = Connection::open_in_memory().unwrap();
+        migrations::runner()
+            .set_abort_divergent(true)
+            .set_abort_missing(true)
+            .run(&mut fresh)
+            .unwrap();
+        assert!(
+            open_sessions_index_present(&fresh),
+            "a fresh install must have idx_sessions_open_started"
+        );
+        assert_eq!(
+            applied_max(&upgraded),
+            applied_max(&fresh),
+            "upgrade and fresh install reach the same schema version"
+        );
+        assert_eq!(
+            applied_max(&fresh),
+            max_supported_version(),
+            "the fresh install is at the newest embedded migration"
+        );
+    }
+
+    /// V113 adds `trust_class` to `observations` and `pages`: pre-V113 rows
+    /// default to `model_generated`, post-V113 rows persist their assigned or
+    /// derived class, and the CHECK constraint rejects unknown values.
+    #[test]
+    fn v113_adds_trust_class_columns_with_model_generated_default() {
+        use ai_memory_core::{NewPage, PagePath, Tier, TrustClass};
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 112).unwrap();
+        let workspace_id = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
+        let project_id =
+            crate::ops::get_or_create_project(&mut conn, &workspace_id, "proj", None).unwrap();
+        let session_id = SessionId::new();
+        crate::ops::begin_session(
+            &mut conn,
+            &NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+                origin: None,
+            },
+        )
+        .unwrap();
+        let legacy_obs = crate::ops::insert_observation(
+            &mut conn,
+            &NewObservation {
+                occurred_at: None,
+                session_id,
+                workspace_id,
+                project_id,
+                kind: ObservationKind::PostToolUse,
+                extension: None,
+                source_event: None,
+                title: "tool".into(),
+                body: "legacy obs".into(),
+                importance: 5,
+                file_path: None,
+                trust_class: None,
+            },
+        )
+        .unwrap();
+        let legacy_page = crate::ops::upsert_page(
+            &mut conn,
+            &NewPage {
+                workspace_id,
+                project_id,
+                path: PagePath::new("notes/legacy.md").unwrap(),
+                title: "legacy".into(),
+                body: "before V113".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+                evidence: Vec::new(),
+                trust_class: None,
+            },
+        )
+        .unwrap();
+
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        run(&mut conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        let obs_trust: String = conn
+            .query_row(
+                "SELECT trust_class FROM observations WHERE id = ?1",
+                [legacy_obs.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(obs_trust, "model_generated");
+
+        let page_trust: String = conn
+            .query_row(
+                "SELECT trust_class FROM pages WHERE id = ?1",
+                [legacy_page.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(page_trust, "model_generated");
+
+        // Post-V113 observation persists its ingress trust class.
+        let new_obs = crate::ops::insert_observation(
+            &mut conn,
+            &NewObservation {
+                occurred_at: None,
+                session_id,
+                workspace_id,
+                project_id,
+                kind: ObservationKind::PostToolUse,
+                extension: None,
+                source_event: None,
+                title: "tool".into(),
+                body: "after V113".into(),
+                importance: 5,
+                file_path: None,
+                trust_class: Some(TrustClass::ToolResult),
+            },
+        )
+        .unwrap();
+        let new_obs_trust: String = conn
+            .query_row(
+                "SELECT trust_class FROM observations WHERE id = ?1",
+                [new_obs.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_obs_trust, "tool_result");
+
+        // CHECK constraint rejects invalid trust_class values.
+        let invalid = conn.execute(
+            "UPDATE pages SET trust_class = 'forged' WHERE id = ?1",
+            [legacy_page.as_bytes()],
+        );
+        assert!(
+            invalid.is_err(),
+            "CHECK constraint must reject invalid trust_class"
+        );
+    }
+
+    /// V114 rebuilds the auxiliary rows of pages and observations stored
+    /// before #2426 taught `cjk_index_terms` Arabic. Those rows exist with no
+    /// terms, so the startup backfill (an anti-join above its watermark)
+    /// skipped them and a normalized Arabic query never reached them (#2439).
+    /// A row without Arabic text keeps its auxiliary row.
+    #[test]
+    fn v114_reindexes_arabic_rows_stored_before_the_arabic_terms() {
+        use ai_memory_core::{NewPage, PagePath, Tier};
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 113).unwrap();
+        let workspace_id = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
+        let project_id =
+            crate::ops::get_or_create_project(&mut conn, &workspace_id, "proj", None).unwrap();
+        let session_id = SessionId::new();
+        crate::ops::begin_session(
+            &mut conn,
+            &NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+                origin: None,
+            },
+        )
+        .unwrap();
+        crate::ops::insert_observation(
+            &mut conn,
+            &NewObservation {
+                occurred_at: None,
+                session_id,
+                workspace_id,
+                project_id,
+                kind: ObservationKind::PostToolUse,
+                extension: None,
+                source_event: None,
+                title: "tool".into(),
+                body: "إدارة المعرفة".into(),
+                importance: 5,
+                file_path: None,
+                trust_class: None,
+            },
+        )
+        .unwrap();
+        // The Arabic page comes first, so a watermark left at the top rowid
+        // sits above it.
+        for (path, body) in [
+            ("notes/arabic.md", "إدارة المعرفة"),
+            ("notes/latin.md", "plain latin notes"),
+        ] {
+            crate::ops::upsert_page(
+                &mut conn,
+                &NewPage {
+                    workspace_id,
+                    project_id,
+                    path: PagePath::new(path).unwrap(),
+                    title: "notes".into(),
+                    body: body.into(),
+                    tier: Tier::Semantic,
+                    frontmatter_json: serde_json::json!({}),
+                    pinned: false,
+                    links: Vec::new(),
+                    author_id: None,
+                    expires_at: None,
+                    entities: Vec::new(),
+                    evidence: Vec::new(),
+                    trust_class: None,
+                },
+            )
+            .unwrap();
+        }
+
+        // What a store written before #2426 holds: an auxiliary row for every
+        // source row, with no terms for Arabic text, and both watermarks at
+        // the top rowid after a finished backfill.
+        conn.execute_batch(
+            "UPDATE pages_cjk_fts SET title = '', body = '', path_search = ''; \
+             UPDATE observations_cjk_fts SET title = '', body = ''; \
+             INSERT INTO backfill_watermarks (name, max_rowid) \
+                 SELECT 'cjk_pages', max(rowid) FROM pages; \
+             INSERT INTO backfill_watermarks (name, max_rowid) \
+                 SELECT 'cjk_observations', max(rowid) FROM observations;",
+        )
+        .unwrap();
+        let arabic_matches = |conn: &Connection, table: &str| -> i64 {
+            // A variant spelling: bare Alef where the stored text has Hamza.
+            let query = crate::fts_query::prepare_cjk_fts5_query("ادارة").unwrap();
+            conn.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE {table} MATCH ?1"),
+                [query],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let stale = crate::ops::backfill_cjk_indexes(&mut conn).unwrap();
+        assert_eq!((stale.pages, stale.observations), (0, 0));
+        for table in ["pages_cjk_fts", "observations_cjk_fts"] {
+            assert_eq!(arabic_matches(&conn, table), 0, "{table} before V114");
+        }
+
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        run(&mut conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        // Only the Arabic rows lost their auxiliary rows, and both watermarks
+        // moved below them, so the next backfill rebuilds exactly those.
+        let rebuilt = crate::ops::backfill_cjk_indexes(&mut conn).unwrap();
+        assert_eq!((rebuilt.pages, rebuilt.observations), (1, 1));
+        for table in ["pages_cjk_fts", "observations_cjk_fts"] {
+            assert_eq!(arabic_matches(&conn, table), 1, "{table} after V114");
+        }
     }
 }

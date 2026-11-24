@@ -64,3 +64,20 @@ are deliberately kept outside this public checkout.
   companion publication.
 - No compatibility claim is made for future upstream versions, multiple
   installations, custom service ports or non-Codex Hook trust diagnostics.
+
+## Upstream sync verification: 2026-11-25
+
+The fork was merged with official v3.6.0. Its core Rust source, Cargo files
+and hook bundle match that tag; the existing Windows companion was retained.
+The original upstream README was refreshed byte-for-byte from v3.6.0.
+
+On this Windows host, all 16 isolated companion regression tests passed.
+All 11 Python files and 12 PowerShell files parsed, the C# tray compiled,
+and a temporary installation respected custom paths without registering
+startup, launching a service or changing the installed production data.
+`install.ps1 -Plan` performed no writes. These checks do not establish a
+clean-machine deployment or a real sign-out/reboot test.
+
+The private installed deployment was checked separately; no private
+configuration, credentials, memory data or operational receipts are included
+in this fork. GitHub Actions records the CI outcome for the pushed commit.

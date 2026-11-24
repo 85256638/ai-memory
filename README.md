@@ -2,7 +2,7 @@
 
 为原生 AI Memory 增加 **Windows 状态托盘、独立巡检、私密验证备份和更新保护**。
 
-这是 [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory) 的公开 fork，定制基于官方 **v3.4.3**。保留上游完整源码及 MIT 许可证；新增功能位于 [`companions/ai-memory-windows`](companions/ai-memory-windows)，核心 Rust 程序沿用上游版本。
+这是 [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory) 的公开 fork，定制基于官方 **v3.6.0**。保留上游完整源码及 MIT 许可证；新增功能位于 [`companions/ai-memory-windows`](companions/ai-memory-windows)，核心 Rust 程序沿用上游版本。
 
 **[安装与使用](companions/ai-memory-windows/README.md) · [验证记录](companions/ai-memory-windows/VALIDATION.md) · [原版 README](README.upstream.md) · [上游变更](CHANGELOG.md)**
 
@@ -22,7 +22,7 @@
 
 ```mermaid
 flowchart LR
-    H["Agent Hooks + MCP"] --> A["Official AI Memory v3.4.3"]
+    H["Agent Hooks + MCP"] --> A["Official AI Memory v3.6.0"]
     W["Windows scheduled health watch"] -->|"Official CLI checks"| A
     W --> S["Private status files"]
     W --> B["Private verified backups"]
@@ -70,7 +70,7 @@ Windows 登录启动、通知区显示、账户可用模型及未来上游版本
 
 ## Upstream / English
 
-This fork keeps the upstream v3.4.3 Rust server and adds an optional Windows companion for tray status, scheduled health checks, verified private backups, upgrade protection and bounded image-spool repair. Paths and provider settings are configurable; no installed memory store or credentials are distributed.
+This fork keeps the upstream v3.6.0 Rust server and adds an optional Windows companion for tray status, scheduled health checks, verified private backups, upgrade protection and bounded image-spool repair. Paths and provider settings are configurable; no installed memory store or credentials are distributed.
 
 Read the [Windows companion guide](companions/ai-memory-windows/README.md) for prerequisites and installation, or the [original upstream README](README.upstream.md) for AI Memory itself.
 

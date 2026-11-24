@@ -211,6 +211,7 @@ async fn contextual_page_sources_preserve_shared_pages_and_refuse_foreign_or_pri
                 actor_user: owner
                     .map(|name| ai_memory_core::IdentityKey::User(name.into()).storage_key()),
                 occurred_at: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -229,6 +230,7 @@ async fn contextual_page_sources_preserve_shared_pages_and_refuse_foreign_or_pri
         author_id: None,
         actor: ActorContext::anonymous(),
         evidence,
+        trust_class: None,
     };
     wiki.write_page(request(foreign, "secret.md", "# FOREIGN_SECRET", vec![]))
         .await
@@ -241,10 +243,12 @@ async fn contextual_page_sources_preserve_shared_pages_and_refuse_foreign_or_pri
             .map(|id| PageEvidence {
                 kind: PageEvidenceKind::Session,
                 source_id: id.to_string(),
+                observations: Default::default(),
             })
             .chain([PageEvidence {
                 kind: PageEvidenceKind::Feedback,
                 source_id: "OPAQUE_PRIVATE_IDENTIFIER".into(),
+                observations: Default::default(),
             }])
             .collect(),
     ))
@@ -427,6 +431,7 @@ async fn contextual_evidence_paginates_versions_and_hides_expired_disagreements(
         author_id: None,
         actor: ActorContext::anonymous(),
         evidence,
+        trust_class: None,
     };
     let id = wiki
         .write_page(request(
@@ -436,6 +441,7 @@ async fn contextual_evidence_paginates_versions_and_hides_expired_disagreements(
                 .map(|n| PageEvidence {
                     kind: PageEvidenceKind::Reconsolidation,
                     source_id: format!("private-opaque-{n}"),
+                    observations: Default::default(),
                 })
                 .collect(),
         ))

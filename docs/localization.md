@@ -41,6 +41,15 @@ Known fixed authentication errors are localized at the display boundary; their
 wire representation stays unchanged. Unknown diagnostic text is preserved.
 Bundled product guides and release notes keep their source language.
 
+### Generated memory language
+
+The language of generated memory prose is separate from the interface
+language. By default, consolidation, dream merges, bootstrap, and
+auto-improvement write prose in the dominant language of their input. Set
+`[consolidation] output_language` (for example `"English"`) to force one
+language for all of them. Evidence quotes, code, identifiers, paths and raw
+session history always stay verbatim.
+
 ### Known gaps
 
 These strings still appear in English under `pt-BR`:
@@ -97,7 +106,8 @@ error, a warning, a workstream, project or profile name) goes through
 way and then neutralizes terminal controls; hook warnings get the same from
 `process_diagnostic`, and the catalog lines of `run` and the commands that
 recover, resume or report its workstreams use `localization::format`, as does
-any other catalog line that quotes an error or a reason.
+any other catalog line that quotes an error, a reason, or a workspace or
+project name (a marker the repository shipped or the server supplies those).
 Web templates use `label`, the same lookup, for fixed text that Rust passes to them.
 Hook commands run before configuration loads, so they follow only
 `AI_MEMORY_LANGUAGE`. Commented configuration snippets printed for pasting stay

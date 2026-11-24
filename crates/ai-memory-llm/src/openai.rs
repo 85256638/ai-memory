@@ -1,6 +1,7 @@
 //! OpenAI Chat Completions client (with `response_format` JSON schema for
 //! structured output).
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -8,6 +9,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
+use crate::api_key_file::ApiKeyFile;
 use crate::error::{LlmError, LlmResult};
 use crate::provider::LlmProvider;
 use crate::response::{provider_error, response_json_limited};
@@ -39,6 +41,23 @@ pub(crate) const STRUCTURED_OUTPUT_SCHEMA_NAME: &str = "Result";
 /// `AI_MEMORY_LLM_HEADERS` entry for this name there; the official OpenAI
 /// and OpenCode providers keep their own contracts.
 pub(crate) const REQUEST_ID_HEADER: &str = "x-request-id";
+
+/// Request metadata headers the `openai-compat` provider sends next to
+/// [`REQUEST_ID_HEADER`] when `llm_request_metadata_headers` is on: the
+/// operation's [`crate::LlmWorkload`] label, then the workspace, project and
+/// username of its [`crate::LlmSubject`], each only when the call site named
+/// one. Reserved the same way: the factory refuses a static
+/// `AI_MEMORY_LLM_HEADERS` entry for any of them on that path.
+pub(crate) const WORKLOAD_HEADER: &str = "x-ai-memory-workload";
+pub(crate) const WORKSPACE_HEADER: &str = "x-ai-memory-workspace";
+pub(crate) const PROJECT_HEADER: &str = "x-ai-memory-project";
+pub(crate) const USER_HEADER: &str = "x-ai-memory-user";
+pub(crate) const REQUEST_METADATA_HEADERS: [&str; 4] = [
+    WORKLOAD_HEADER,
+    WORKSPACE_HEADER,
+    PROJECT_HEADER,
+    USER_HEADER,
+];
 
 /// Build the full URL for an OpenAI-style endpoint. Tolerates the
 /// conventions found in the wild:
@@ -100,6 +119,9 @@ pub enum RequestDialect {
 pub struct OpenAiProvider {
     client: reqwest::Client,
     api_key: SecretString,
+    /// When set, the key comes from this file instead of `api_key`: read on
+    /// first use, re-read once after a `401` (see [`Self::post`]).
+    api_key_file: Option<ApiKeyFile>,
     base_url: String,
     model: String,
     dialect: RequestDialect,
@@ -117,6 +139,10 @@ pub struct OpenAiProvider {
     /// turns it on only for the configured `openai-compat` provider, so
     /// the official OpenAI and OpenCode providers never gain the header.
     request_id_header: bool,
+    /// OpenAI-compat only: send [`REQUEST_METADATA_HEADERS`] on every chat
+    /// attempt. Off unless the operator opts in, and, like
+    /// `request_id_header`, only ever turned on for `openai-compat`.
+    request_metadata_headers: bool,
     /// OpenAI-compat only: send `chat_template_kwargs` with every chat
     /// request (see [`Self::with_disable_thinking`]). Ignored by the
     /// `Official` dialect, which would 400 on the unknown parameter.
@@ -145,6 +171,7 @@ impl OpenAiProvider {
         Ok(Self {
             client,
             api_key,
+            api_key_file: None,
             base_url: DEFAULT_BASE_URL.to_string(),
             model: model.into(),
             dialect: RequestDialect::Official,
@@ -154,6 +181,7 @@ impl OpenAiProvider {
             extra_headers: ExtraHeaders::default(),
             client_headers: None,
             request_id_header: false,
+            request_metadata_headers: false,
             disable_thinking: false,
         })
     }
@@ -163,6 +191,14 @@ impl OpenAiProvider {
     #[must_use]
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
+        self
+    }
+
+    /// Read the API key from `path` instead of the key given to
+    /// [`Self::new`], so a key rotated in the file reaches a running server.
+    #[must_use]
+    pub(crate) fn with_api_key_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.api_key_file = Some(ApiKeyFile::new(path));
         self
     }
 
@@ -241,6 +277,15 @@ impl OpenAiProvider {
     #[must_use]
     pub(crate) fn with_request_id_header(mut self) -> Self {
         self.request_id_header = true;
+        self
+    }
+
+    /// Send [`REQUEST_METADATA_HEADERS`] on every chat attempt, carried by
+    /// the operation id the same way [`REQUEST_ID_HEADER`] is, so every
+    /// attempt of one operation sends the same values.
+    #[must_use]
+    pub(crate) fn with_request_metadata_headers(mut self, enabled: bool) -> Self {
+        self.request_metadata_headers = enabled;
         self
     }
 
@@ -598,13 +643,49 @@ impl OpenAiProvider {
         body: &B,
         operation_id: LlmOperationId,
     ) -> LlmResult<OpenAiResponse> {
+        let resp = match &self.api_key_file {
+            None => self.send(body, &operation_id, &self.api_key).await?,
+            Some(file) => {
+                let key = file.current().await?;
+                let resp = self.send(body, &operation_id, &key).await?;
+                // One retry, and only when the file now holds a different
+                // key: a file still holding the rejected key returns the
+                // 401 as is, so a stale token never loops.
+                if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
+                    resp
+                } else {
+                    match file.rotated(&key).await {
+                        Ok(Some(rotated)) => self.send(body, &operation_id, &rotated).await?,
+                        Ok(None) => resp,
+                        // The 401 is the failure to report; an unreadable
+                        // file mid-rewrite is only why it was not retried.
+                        Err(error) => {
+                            tracing::warn!(%error, "API key file not re-read after a 401");
+                            resp
+                        }
+                    }
+                }
+            }
+        };
+        if !resp.status().is_success() {
+            return Err(provider_error(resp).await);
+        }
+        response_json_limited::<OpenAiResponse>(resp).await
+    }
+
+    async fn send<B: Serialize>(
+        &self,
+        body: &B,
+        operation_id: &LlmOperationId,
+        api_key: &SecretString,
+    ) -> LlmResult<reqwest::Response> {
         let url = normalize_openai_base(&self.base_url, "chat/completions");
         debug!(url, "POST openai");
         let builder = self
             .client
             .post(&url)
             .timeout(self.timeout)
-            .bearer_auth(self.api_key.expose_secret())
+            .bearer_auth(api_key.expose_secret())
             .header("content-type", "application/json");
         // Both header layers go on in one `apply`, which replaces per name.
         // Adding them separately with `RequestBuilder::header` would *append*
@@ -626,6 +707,9 @@ impl OpenAiProvider {
                         headers.insert(HeaderName::from_static(REQUEST_ID_HEADER), value);
                     }
                 }
+                if self.request_metadata_headers {
+                    insert_request_metadata(&mut headers, operation_id);
+                }
                 headers.apply(builder)
             }
             Some(client) => {
@@ -646,20 +730,44 @@ impl OpenAiProvider {
                 headers.apply(builder)
             }
         };
-        let resp = request.json(body).send().await?;
-        if !resp.status().is_success() {
-            return Err(provider_error(resp).await);
+        Ok(request.json(body).send().await?)
+    }
+}
+
+/// Add the opt-in request metadata for one attempt: the workload label
+/// always, and each subject value only when the call site named one. A value
+/// that is not a valid header value (a non-ASCII project name) is left out
+/// like an unknown one: the operation is worth more than its annotation.
+fn insert_request_metadata(headers: &mut ExtraHeaders, operation_id: &LlmOperationId) {
+    let subject = operation_id.subject();
+    let values = [
+        (WORKLOAD_HEADER, Some(operation_id.workload().as_str())),
+        (
+            WORKSPACE_HEADER,
+            subject.and_then(|s| s.workspace.as_deref()),
+        ),
+        (PROJECT_HEADER, subject.and_then(|s| s.project.as_deref())),
+        (USER_HEADER, subject.and_then(|s| s.user.as_deref())),
+    ];
+    for (name, value) in values {
+        if let Some(Ok(value)) = value.map(HeaderValue::from_str) {
+            headers.insert(HeaderName::from_static(name), value);
         }
-        response_json_limited::<OpenAiResponse>(resp).await
     }
 }
 
 /// `true` when the engine reports the output stopped at the token budget
 /// rather than at a natural end. OpenAI and the local engines spell it
-/// `length`; engines that omit the field report `None` and are never
-/// truncated by this classifier.
+/// `length`. Some OpenAI-compatible gateways in front of Claude (seen with
+/// 9router relaying Claude Haiku) pass Anthropic's own `max_tokens` stop
+/// reason through unchanged
+/// (<https://docs.anthropic.com/en/api/handling-stop-reasons>). Engines that
+/// omit the field report `None` and are never truncated by this classifier.
 pub(crate) fn is_length_truncated(finish_reason: Option<&str>) -> bool {
-    finish_reason.is_some_and(|reason| reason.trim().eq_ignore_ascii_case("length"))
+    finish_reason.is_some_and(|reason| {
+        let reason = reason.trim();
+        reason.eq_ignore_ascii_case("length") || reason.eq_ignore_ascii_case("max_tokens")
+    })
 }
 
 /// Recursively normalise a JSON schema for OpenAI Structured Outputs
@@ -1484,6 +1592,9 @@ mod tests {
         // still classify, and every other stop reason must not.
         assert!(is_length_truncated(Some(" length ")));
         assert!(is_length_truncated(Some("LENGTH")));
+        // Anthropic's spelling, relayed as-is by some compatible gateways.
+        assert!(is_length_truncated(Some("max_tokens")));
+        assert!(is_length_truncated(Some("MAX_TOKENS")));
         assert!(!is_length_truncated(None));
         assert!(!is_length_truncated(Some("stop")));
         assert!(!is_length_truncated(Some("tool_calls")));

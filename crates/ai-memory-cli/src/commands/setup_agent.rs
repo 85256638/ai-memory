@@ -43,7 +43,7 @@ use crate::commands::render_shared::{
     ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, COMMAND_CODE_PROFILE,
     COPILOT_CLI_PROFILE, CURSOR_PROFILE, GEMINI_PROFILE, KIMI_CODE_EVENTS, KIRO_CLI_V2_EVENTS,
     KIRO_CLI_V3_EVENTS, build_claude_code_payload, build_devin_payload, build_dsh_hooks_payload,
-    build_grok_payload, build_pool_settings_yaml, hook_script_for_current_platform,
+    build_grok_payload, build_pool_settings_yaml, hook_script_for_current_platform, mask_secret,
 };
 use crate::commands::{install_hooks, install_mcp};
 use crate::config::{Config, DEFAULT_SERVER_URL};
@@ -82,6 +82,16 @@ pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
         auth_token: args
             .auth_token
             .or_else(|| config.auth.renderable_bearer_token().map(str::to_owned)),
+        ..args
+    };
+    // setup-agent only ever PRINTS the token into a snippet for the operator to
+    // merge into their agent config; it never writes it to a protected file. So
+    // mask the inline bearer in every snippet it emits, so the live value is not
+    // left in the terminal scrollback, a CI log or an agent transcript
+    // (GHSA-6pmr-q79m-87vp item 1). The notes that key off "a token was given"
+    // still fire — the masked value is still `Some`.
+    let args = SetupAgentArgs {
+        auth_token: args.auth_token.as_deref().map(mask_secret),
         ..args
     };
     if matches!(
@@ -126,6 +136,11 @@ pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
     // CodeBuddy too: ~/.codebuddy/settings.json runs the native `hook` command.
     if matches!(args.agent, AgentChoice::CodeBuddy) {
         emit_codebuddy(&args)?;
+        return Ok(());
+    }
+    // WorkBuddy too: ~/.workbuddy/settings.json runs the native `hook` command.
+    if matches!(args.agent, AgentChoice::WorkBuddy) {
+        emit_workbuddy(&args)?;
         return Ok(());
     }
     // IBM Bob's settings run the native hook command directly too.
@@ -294,6 +309,7 @@ pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
         | AgentChoice::Droid
         | AgentChoice::Muse
         | AgentChoice::CodeBuddy
+        | AgentChoice::WorkBuddy
         | AgentChoice::IbmBob
         | AgentChoice::Cline
         | AgentChoice::QwenCode
@@ -366,7 +382,7 @@ fn emit_zcode(args: &SetupAgentArgs) -> Result<()> {
     Ok(())
 }
 
-/// Print the `hooks:` block for `~/.hermes/config.yaml` (the follow-up to
+/// Print the `hooks:` block for the Hermes home's `config.yaml` (the follow-up to
 /// #623, where Hermes was accepted for capture/storage but had no installer).
 /// No scripts are staged: Hermes splits the configured `command` itself and
 /// runs the ai-memory binary directly with the JSON payload on stdin. The
@@ -386,7 +402,12 @@ fn hermes_setup_output(args: &SetupAgentArgs, plugin_dir: Option<&Path>) -> Stri
         hook_set,
     );
     let mut out = String::new();
-    out.push_str("# Hermes Agent — merge the `hooks:` block into ~/.hermes/config.yaml\n");
+    out.push_str(
+        "# Hermes Agent — merge the `hooks:` block into the config.yaml of the\n\
+         # Hermes home that runs it (`$HERMES_HOME/config.yaml`, else\n\
+         # `~/.hermes/config.yaml`; `%LOCALAPPDATA%\\hermes\\config.yaml` on\n\
+         # Windows).\n",
+    );
     out.push_str("# The `command` must be an ai-memory binary reachable on the host that\n");
     out.push_str("# runs Hermes; prefer `ai-memory install-hooks --agent hermes` from\n");
     out.push_str("# that host so the path is resolved for you.\n");
@@ -523,6 +544,32 @@ fn emit_qwen_code(args: &SetupAgentArgs) -> Result<()> {
     Ok(())
 }
 
+/// Print the `hooks` block for `~/.workbuddy/settings.json`. No scripts are
+/// staged: each entry runs the ai-memory binary's native `hook` command with
+/// WorkBuddy's event JSON on stdin. WorkBuddy fires no `SessionEnd`.
+fn emit_workbuddy(args: &SetupAgentArgs) -> Result<()> {
+    let payload = crate::commands::render_shared::build_workbuddy_hooks_payload(
+        &args.server_url,
+        args.auth_token.as_deref(),
+        None,
+        None,
+    );
+    let serialized = serde_json::to_string_pretty(&payload["hooks"])
+        .context("serializing WorkBuddy hook config")?;
+    println!("# WorkBuddy — merge under the `hooks` key of");
+    println!("# ~/.workbuddy/settings.json. The `command` must be an ai-memory");
+    println!("# binary reachable on the host that runs WorkBuddy; prefer");
+    println!("# `ai-memory install-hooks --agent workbuddy --apply` from that host.");
+    println!("# WorkBuddy fires no SessionEnd, so close a finished session with");
+    println!("# `ai-memory finalize-session --agent workbuddy`.");
+    if args.auth_token.is_some() {
+        println!("#       Treat settings.json as sensitive (chmod 600).");
+    }
+    println!();
+    println!("{serialized}");
+    Ok(())
+}
+
 fn normalise_hook_server_url(url: &str) -> String {
     url.trim().trim_end_matches('/').to_string()
 }
@@ -592,6 +639,7 @@ fn emit_extension_setup_hint(config: &Config, args: &SetupAgentArgs) -> Result<(
         install_hooks::run_with_opencode_dialect(
             config,
             InstallHooksArgs {
+                absolute_paths: false,
                 agent: AgentChoice::OpenCode,
                 hooks_dir: None,
                 server_url: Some(args.server_url.clone()),
@@ -755,6 +803,7 @@ fn emit_dsh(emit_root: &Path, args: &SetupAgentArgs) {
         args.auth_token.as_deref(),
         None,
         None,
+        false,
     );
     println!("# DeepSeek Harness (DSH) — DSH has no fixed agent config file.");
     println!("# Hook scripts (must be reachable from the host that runs DSH):");
@@ -789,7 +838,7 @@ fn render_devin_setup_output(emit_root: &Path, args: &SetupAgentArgs) -> Result<
         serde_json::to_string_pretty(&payload).context("serializing Devin hook config")?;
     let mut out = String::new();
     out.push_str(
-        "# Devin CLI — write to ~/.devin/hooks.v1.json or ~/.devin/config.json hooks key\n",
+        "# Devin CLI — merge into ~/.config/devin/config.json (or project .devin/hooks.v1.json)\n",
     );
     out.push_str("# Hook scripts (must be reachable from the host that runs Devin):\n");
     out.push_str(&format!("#   {}\n", emit_root.display()));
@@ -797,7 +846,7 @@ fn render_devin_setup_output(emit_root: &Path, args: &SetupAgentArgs) -> Result<
     if args.auth_token.is_some() {
         out.push_str("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.\n");
         out.push_str(
-            "#       Treat ~/.devin/hooks.v1.json or ~/.devin/config.json as sensitive (chmod 600).\n",
+            "#       Treat ~/.config/devin/config.json (or .devin/hooks.v1.json) as sensitive (chmod 600).\n",
         );
     }
     out.push_str(
@@ -1176,7 +1225,7 @@ mod tests {
         let rendered = render_devin_setup_output(emit_root, &args).unwrap();
 
         assert!(rendered.contains("# Devin CLI"));
-        assert!(rendered.contains("~/.devin/hooks.v1.json"));
+        assert!(rendered.contains("~/.config/devin/config.json"));
         assert!(rendered.contains("hookSpecificOutput.additionalContext"));
         assert!(rendered.contains("AI_MEMORY_AUTH_TOKEN"));
 
@@ -1257,8 +1306,12 @@ mod tests {
         assert!(rendered.contains("post-tool-use"));
         assert!(rendered.contains("pre-compact"));
         assert!(
-            !rendered.contains("user-prompt-submit"),
-            "Gemini has no UserPromptSubmit hook; setup-agent must not print Claude-only scripts"
+            rendered.contains("user-prompt-submit"),
+            "Gemini's BeforeAgent runs the prompt script: {rendered}"
+        );
+        assert!(
+            rendered.contains("stop.sh"),
+            "Gemini's AfterAgent runs the stop script: {rendered}"
         );
         assert!(
             !rendered.contains("subagent-start") && !rendered.contains("subagent-stop"),
@@ -1268,10 +1321,11 @@ mod tests {
 
     #[test]
     fn kimi_code_manual_script_paths_cover_kimi_event_set() {
-        // Kimi Code's hook vocabulary is Claude Code's ten events,
-        // PostToolUseFailure included; the failure entry reuses
-        // post-tool-use.sh, so the script list carries nine unique files for
-        // ten events.
+        // Kimi Code's hook vocabulary is Claude Code's events,
+        // PostToolUseFailure and StopFailure included, plus Interrupt; the
+        // failure entry reuses post-tool-use.sh and the two abnormal turn
+        // ends reuse stop.sh, so the script list carries nine unique files
+        // for twelve events.
         let root = Path::new("/hooks/kimi-code");
         let paths = event_script_paths(root, &[&KIMI_CODE_EVENTS]);
         let rendered = paths
@@ -1301,7 +1355,7 @@ mod tests {
                 .iter()
                 .any(|(event, _)| *event == "PostToolUseFailure")
         );
-        assert_eq!(KIMI_CODE_EVENTS.len(), 10);
+        assert_eq!(KIMI_CODE_EVENTS.len(), 12);
         assert_eq!(paths.len(), 9);
     }
 

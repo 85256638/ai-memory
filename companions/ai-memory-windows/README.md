@@ -1,8 +1,8 @@
 # AI Memory Windows companion
 
-Windows 托盘、独立巡检、私密备份和安全更新脚本，适用于已有的 AI Memory 原生安装。基于官方 **v3.4.3**；核心 Rust 程序沿用上游。
+Windows 托盘、独立巡检、私密备份和安全更新脚本，适用于已有的 AI Memory 原生安装。基于官方 **v3.6.0**；核心 Rust 程序沿用上游。
 
-This optional companion adds a Windows status tray, scheduled health checks, private verified backups and an upgrade wrapper. The Rust server stays at upstream v3.4.3. It is intended for one Windows user, one local installation and the default loopback port.
+This optional companion adds a Windows status tray, scheduled health checks, private verified backups and an upgrade wrapper. The Rust server stays at upstream v3.6.0. It is intended for one Windows user, one local installation and the default loopback port.
 
 ## 安装前确认
 
@@ -97,7 +97,7 @@ flowchart LR
 指定版本更新，默认安装位置下可执行：
 
 ```powershell
-& (Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'ai-memory-data\ops\update_ai_memory.ps1') -Version 'v3.4.3'
+& (Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'ai-memory-data\ops\update_ai_memory.ps1') -Version 'v3.6.0'
 ```
 
 请将版本参数改为已审查的目标版本。脚本先设置维护标记、生成并验证备份，再调用官方 `upgrade`、合作重启服务并核对版本。备份失败即停止，不强制结束未知进程。
@@ -124,10 +124,10 @@ python -m unittest discover -s '.\companions\ai-memory-windows\tests' -v
 
 测试覆盖图片原件保留、事件身份、未知输入不变、文件锁竞争、非零补传报告、可配置路径、只读数据库备份核验及 HTTPS 目的地址校验。测试使用临时目录和合成事件，不读写已安装的记忆数据库。
 
-完整验证记录见 [VALIDATION.md](VALIDATION.md)。当前适配针对 v3.4.3、单个本机安装、默认端口和 Codex Hook 检查。尚未覆盖新 Windows 用户/空白电脑的完整部署、真实注销登录和其他上游版本；托盘颜色也不证明记忆内容准确或所有模型任务均已成功。
+完整验证记录见 [VALIDATION.md](VALIDATION.md)。当前适配针对 v3.6.0、单个本机安装、默认端口和 Codex Hook 检查。尚未覆盖新 Windows 用户/空白电脑的完整部署、真实注销登录和未来上游版本；托盘颜色也不证明记忆内容准确或所有模型任务均已成功。
 
 ## 来源与许可
 
-上游：[akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory)，基准标签 [v3.4.3](https://github.com/akitaonrails/ai-memory/tree/v3.4.3)。官方安装、模型、Hook 与 MCP 说明见[原版 README](../../README.upstream.md)。
+上游：[akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory)，基准标签 [v3.6.0](https://github.com/akitaonrails/ai-memory/tree/v3.6.0)。官方安装、模型、Hook 与 MCP 说明见[原版 README](../../README.upstream.md)。
 
 本目录是 fork 的可选 Windows 定制，按仓库 [MIT 许可证](../../LICENSE)分发。保留上游作者及许可证声明，不代表上游官方提供支持。

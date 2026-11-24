@@ -14,8 +14,8 @@ use ai_memory_llm::{
     ChatMessage, ChatRequest, LlmError, LlmOperationId, LlmProvider, Role,
     complete_structured_with_operation_id,
 };
-use ai_memory_store::{ReaderPool, StoreError, WriterHandle};
-use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki, WritePageRequest};
+use ai_memory_store::{PagePrecondition, ReaderPool, StoreError, WriterHandle};
+use ai_memory_wiki::{AdmissionContext, AdmissionOp, ConditionalWrite, Wiki, WritePageRequest};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -64,6 +64,12 @@ pub enum ConsolidatorError {
     /// Session had no observations to consolidate.
     #[error("session {0} has no observations")]
     EmptySession(SessionId),
+
+    /// The session page kept changing under a conditional write
+    /// ([`Consolidator::consolidate_session_keeping_agent_page`]); nothing was
+    /// written and the job can be retried.
+    #[error("session {0} page kept changing during consolidation")]
+    SessionPageContended(SessionId),
 }
 
 impl From<serde_json::Error> for ConsolidatorError {
@@ -94,6 +100,7 @@ pub fn redacted_error_summary(error: &ConsolidatorError) -> String {
         ConsolidatorError::Serde(_) => ("serde", None),
         ConsolidatorError::SessionNotFound(_) => ("session-not-found", None),
         ConsolidatorError::EmptySession(_) => ("empty-session", None),
+        ConsolidatorError::SessionPageContended(_) => ("session-page-contended", None),
     };
     format!(
         "consolidation failed: class={class} status={}",
@@ -108,6 +115,76 @@ pub type ConsolidatorResult<T> = Result<T, ConsolidatorError>;
 
 /// Maximum attempts (initial + retries) for one consolidation LLM call.
 const CONSOLIDATION_LLM_MAX_ATTEMPTS: u32 = 3;
+
+/// Conditional writes [`Consolidator::consolidate_session_keeping_agent_page`]
+/// tries before giving the job back to the queue. Each retry follows a
+/// non-agent version that landed during the previous one.
+const SESSION_PAGE_WRITE_ATTEMPTS: usize = 3;
+
+/// What [`Consolidator::consolidate_session_keeping_agent_page`] did.
+#[derive(Debug)]
+pub enum SessionPageConsolidation {
+    /// The server's provider compiled the page and it was written.
+    Consolidated(ConsolidationOutcome),
+    /// The agent wrote the session page itself; it was kept and nothing was
+    /// written.
+    AgentPageKept,
+}
+
+/// A session page the completion produced, ready to write.
+struct PreparedSessionPage {
+    path: PagePath,
+    page: ConsolidatedPage,
+    frontmatter: serde_json::Value,
+    /// Exactly the observations the prompt carried, not the whole session:
+    /// the projection omits rows on a long session (#2164).
+    source_ids: Vec<ai_memory_core::ObservationId>,
+}
+
+impl PreparedSessionPage {
+    fn write_request(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        actor: ai_memory_core::ActorContext,
+        author_id: Option<ai_memory_core::UserId>,
+    ) -> WritePageRequest {
+        WritePageRequest {
+            workspace_id,
+            project_id,
+            path: self.path.clone(),
+            frontmatter: self.frontmatter.clone(),
+            body: self.page.body_markdown.clone(),
+            tier: Tier::Episodic,
+            pinned: false,
+            title: None,
+            admission_ctx: Some(AdmissionContext {
+                op: AdmissionOp::Consolidate,
+                actor: actor.clone(),
+                ..Default::default()
+            }),
+            author_id,
+            actor,
+            evidence: vec![ai_memory_core::PageEvidence {
+                kind: ai_memory_core::PageEvidenceKind::Session,
+                source_id: session_id.to_string(),
+                // Exactly what the prompt carried, not the whole session:
+                // the projection omits rows on a long session (#2164).
+                observations: ai_memory_core::SourceObservations::Listed(self.source_ids.clone()),
+            }],
+            trust_class: None,
+        }
+    }
+}
+
+/// Where [`Consolidator::prepare_session_page`] left a session consolidation.
+enum SessionPagePlan {
+    /// A dry run: the plan, with nothing compiled.
+    DryRun(ConsolidationOutcome),
+    /// A compiled page to write.
+    Write(PreparedSessionPage),
+}
 /// Fixed, short delay between consolidation retries. Deliberately not
 /// tenacity-style escalating backoff — see the cognee #2840 lesson in
 /// `ai-memory-llm`; the same policy `bootstrap.rs` applies to its chunks.
@@ -146,7 +223,9 @@ where
 {
     let mut attempt = 1;
     loop {
-        match complete_structured_with_operation_id::<T>(llm, request.clone(), operation_id).await {
+        match complete_structured_with_operation_id::<T>(llm, request.clone(), operation_id.clone())
+            .await
+        {
             Ok(value) => return Ok(value),
             Err(e) if attempt < CONSOLIDATION_LLM_MAX_ATTEMPTS && e.is_transient() => {
                 let wait = consolidation_retry_wait(&e, retry_delay);
@@ -184,6 +263,8 @@ pub struct Consolidator {
     per_user_slots: bool,
     /// Include bounded literal tokens from omitted prompt observations.
     verbatim_residue: bool,
+    /// Operator-fixed output language for generated prose (#2185).
+    output_language: Option<String>,
     /// Prompt input/output limits derived from `[consolidation]`.
     budgets: PromptBudgets,
 }
@@ -209,6 +290,7 @@ impl Consolidator {
             project_id,
             per_user_slots: false,
             verbatim_residue: false,
+            output_language: None,
             budgets: PromptBudgets::default(),
         }
     }
@@ -255,6 +337,14 @@ impl Consolidator {
         self
     }
 
+    /// Force the natural language of generated prose (`[consolidation]
+    /// output_language`); `None` follows the input's dominant language.
+    #[must_use]
+    pub fn with_output_language(mut self, lang: Option<String>) -> Self {
+        self.output_language = lang;
+        self
+    }
+
     /// Consolidate a single session into a refreshed
     /// `sessions/<id>.md` page.
     ///
@@ -270,10 +360,167 @@ impl Consolidator {
         instructions: Option<&str>,
     ) -> ConsolidatorResult<ConsolidationOutcome> {
         // Resolve the target from where the observations landed (see
-        // `resolve_target`): the bounded reads below gate on the session
-        // holding at least one observation in THAT scope — the (possibly
-        // stale) `sessions` row is not consulted.
+        // `resolve_target`), then consolidate bound to exactly that scope.
         let (ws, proj) = self.resolve_target(session_id).await?;
+        self.consolidate_session_in_scope(
+            ws,
+            proj,
+            session_id,
+            dry_run,
+            actor,
+            author_id,
+            instructions,
+        )
+        .await
+    }
+
+    /// [`Self::consolidate_session`] bound to a caller-supplied scope instead
+    /// of re-resolving it from the session.
+    ///
+    /// A session id reaches consolidation without naming a repository, so an
+    /// authorizing caller (`memory_consolidate`) resolves the write target
+    /// once, authorizes it, and passes it here. That closes the window in
+    /// which a concurrent observation landing in another project could flip
+    /// [`Self::resolve_target`] between the grant check and the write, so the
+    /// page lands in — and, with the scoped snapshot reads, is built only
+    /// from — the scope the caller was granted (GHSA-xfgc-hc4c-wj7h). The
+    /// bounded reads below still gate on the session holding at least one
+    /// observation in THAT scope.
+    ///
+    /// # Errors
+    /// Returns [`ConsolidatorError`] for any store, wiki, or LLM failure.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn consolidate_session_in_scope(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        dry_run: bool,
+        actor: ai_memory_core::ActorContext,
+        author_id: Option<ai_memory_core::UserId>,
+        instructions: Option<&str>,
+    ) -> ConsolidatorResult<ConsolidationOutcome> {
+        let prepared = match self
+            .prepare_session_page(
+                workspace_id,
+                project_id,
+                session_id,
+                dry_run,
+                &actor,
+                instructions,
+            )
+            .await?
+        {
+            SessionPagePlan::DryRun(outcome) => return Ok(outcome),
+            SessionPagePlan::Write(prepared) => prepared,
+        };
+        let request =
+            prepared.write_request(workspace_id, project_id, session_id, actor, author_id);
+        let id = self.wiki.write_page(request).await?;
+        Ok(self.finish_session_page(session_id, prepared, id))
+    }
+
+    /// The SessionEnd worker's consolidation: [`Self::consolidate_session`],
+    /// except that a session page the agent wrote itself
+    /// ([`Wiki::session_page_written_by_agent`]) is kept, whether it was there
+    /// before the job started or landed while the completion ran.
+    ///
+    /// The page version is read before the agent check, and the write is
+    /// conditional on that version ([`Wiki::write_page_if`]). A version that
+    /// lands after the read makes the write back off, so a page the agent
+    /// wrote during the completion is never superseded by the server's. On a
+    /// mismatch the page is checked again: the agent's page ends the job
+    /// without a write; any other page is replaced, as an unconditional
+    /// consolidation would, conditional on the version just seen.
+    ///
+    /// # Errors
+    /// As [`Self::consolidate_session`], plus
+    /// [`ConsolidatorError::SessionPageContended`] when the page keeps moving
+    /// under the write.
+    pub async fn consolidate_session_keeping_agent_page(
+        &self,
+        session_id: SessionId,
+        actor: ai_memory_core::ActorContext,
+    ) -> ConsolidatorResult<SessionPageConsolidation> {
+        let (ws, proj) = self.resolve_target(session_id).await?;
+        // The version first, the agent check second: an agent write landing
+        // between the two reads is either seen by the check or changes the
+        // version the write is conditional on.
+        let mut precondition = match self
+            .reader
+            .latest_page_id_by_ids(ws, proj, format!("sessions/{session_id}.md"))
+            .await?
+        {
+            Some(seen) => PagePrecondition::Latest(seen),
+            None => PagePrecondition::Absent,
+        };
+        // An agent may have written the session page with its own model
+        // while the session was still open, before this job existed. Leave
+        // that page alone: the agent's own tool call, the Stop and the
+        // SessionEnd always land after it, so no observation count can tell
+        // a stale page from a current one.
+        match self
+            .wiki
+            .session_page_written_by_agent(ws, proj, session_id)
+        {
+            Ok(true) => return Ok(SessionPageConsolidation::AgentPageKept),
+            Ok(false) => {}
+            Err(error) => warn!(
+                %error,
+                session = %session_id,
+                "could not read the session page before queued consolidation; consolidating",
+            ),
+        }
+        let prepared = match self
+            .prepare_session_page(ws, proj, session_id, false, &actor, None)
+            .await?
+        {
+            SessionPagePlan::DryRun(outcome) => {
+                return Ok(SessionPageConsolidation::Consolidated(outcome));
+            }
+            SessionPagePlan::Write(prepared) => prepared,
+        };
+        let request = prepared.write_request(ws, proj, session_id, actor, None);
+        for _ in 0..SESSION_PAGE_WRITE_ATTEMPTS {
+            match self
+                .wiki
+                .write_page_if(request.clone(), precondition)
+                .await?
+            {
+                ConditionalWrite::Written(id) => {
+                    return Ok(SessionPageConsolidation::Consolidated(
+                        self.finish_session_page(session_id, prepared, id),
+                    ));
+                }
+                ConditionalWrite::Mismatch { current } => {
+                    if self
+                        .wiki
+                        .session_page_written_by_agent(ws, proj, session_id)?
+                    {
+                        return Ok(SessionPageConsolidation::AgentPageKept);
+                    }
+                    precondition = match current {
+                        Some(current) => PagePrecondition::Latest(current),
+                        None => PagePrecondition::Absent,
+                    };
+                }
+            }
+        }
+        Err(ConsolidatorError::SessionPageContended(session_id))
+    }
+
+    /// Everything [`Self::consolidate_session_in_scope`] does before the page
+    /// write: the gates, the completion and the link guard.
+    async fn prepare_session_page(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        dry_run: bool,
+        actor: &ai_memory_core::ActorContext,
+        instructions: Option<&str>,
+    ) -> ConsolidatorResult<SessionPagePlan> {
+        let (ws, proj) = (workspace_id, project_id);
 
         // Bounded gate: count and span only, no row is materialised. A
         // session with no observations in its consolidation scope — a
@@ -310,14 +557,14 @@ impl Consolidator {
         // return the resolved plan. Callers wanting the actual rewritten body
         // run a real (non-dry) consolidation.
         if dry_run {
-            return Ok(ConsolidationOutcome {
+            return Ok(SessionPagePlan::DryRun(ConsolidationOutcome {
                 path,
                 dry_run: true,
                 new_title: String::new(),
                 new_body_markdown: String::new(),
                 page_id: None,
                 tags: Vec::new(),
-            });
+            }));
         }
 
         let current_body = self
@@ -326,9 +573,7 @@ impl Consolidator {
             .map(|md| md.body)
             .unwrap_or_default();
         let instructions = self.resolve_instructions(ws, proj, instructions).await;
-        let existing_titles = self
-            .existing_page_titles(ws, proj, &actor, session_id)
-            .await;
+        let existing_titles = self.existing_page_titles(ws, proj, actor, session_id).await;
         // The prefix and its budget are known now; only the observation
         // dump is read from the store — bounded: a full read while the
         // session fits the selection cap, otherwise one streaming scan
@@ -361,8 +606,13 @@ impl Consolidator {
         // session id) is shared by every attempt of this invocation; a
         // re-entry after a crash or a new queue claim is a NEW operation
         // with a new id.
-        let operation_id = LlmOperationId::for_workload(ai_memory_llm::LlmWorkload::Consolidation);
-        let request = assemble_single_request(&plan, &projected, self.budgets);
+        let operation_id = LlmOperationId::for_workload(ai_memory_llm::LlmWorkload::Consolidation)
+            .with_subject(self.llm_subject(ws, proj, session_id).await);
+        let mut request = assemble_single_request(&plan, &projected, self.budgets);
+        request.system = Some(crate::with_output_language(
+            SYSTEM_PROMPT,
+            self.output_language.as_deref(),
+        ));
         debug!(
             session = %session_id,
             provider = self.llm.name(),
@@ -408,30 +658,22 @@ impl Consolidator {
             crate::link_guard::delink_body(&page.body_markdown, &path, &unresolved.body)
                 .into_owned();
         crate::link_guard::prune_relations(&mut frontmatter, &unresolved.relations);
-        let id = self
-            .wiki
-            .write_page(WritePageRequest {
-                workspace_id: ws,
-                project_id: proj,
-                path: path.clone(),
-                frontmatter,
-                body: page.body_markdown.clone(),
-                tier: Tier::Episodic,
-                pinned: false,
-                title: None,
-                admission_ctx: Some(AdmissionContext {
-                    op: AdmissionOp::Consolidate,
-                    actor: actor.clone(),
-                    ..Default::default()
-                }),
-                author_id,
-                actor,
-                evidence: vec![ai_memory_core::PageEvidence {
-                    kind: ai_memory_core::PageEvidenceKind::Session,
-                    source_id: session_id.to_string(),
-                }],
-            })
-            .await?;
+        Ok(SessionPagePlan::Write(PreparedSessionPage {
+            path,
+            page,
+            frontmatter,
+            source_ids: projected.source_ids.clone(),
+        }))
+    }
+
+    /// Commit and report a written session page.
+    fn finish_session_page(
+        &self,
+        session_id: SessionId,
+        prepared: PreparedSessionPage,
+        id: ai_memory_core::PageId,
+    ) -> ConsolidationOutcome {
+        let PreparedSessionPage { path, page, .. } = prepared;
         // Auto-commit the result so the supersession lands in git.
         let _ = self
             .wiki
@@ -449,14 +691,14 @@ impl Consolidator {
             page = %id,
             "session consolidated via LLM",
         );
-        Ok(ConsolidationOutcome {
+        ConsolidationOutcome {
             path,
             dry_run: false,
             new_title: page.title,
             new_body_markdown: page.body_markdown,
             page_id: Some(id),
             tags: page.tags,
-        })
+        }
     }
 
     /// Borrow the underlying writer (used by the MCP tool to ack the
@@ -493,6 +735,22 @@ impl Consolidator {
             .unwrap_or((self.workspace_id, self.project_id)))
     }
 
+    /// The scope a consolidation reads and the session's owner, for the
+    /// opt-in request metadata. The owner, not the caller: an operator
+    /// consolidating someone else's session still summarises that person's
+    /// work.
+    async fn llm_subject(
+        &self,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        session_id: SessionId,
+    ) -> ai_memory_llm::LlmSubject {
+        ai_memory_llm::LlmSubject {
+            user: crate::llm_subject::session_owner(&self.reader, session_id).await,
+            ..crate::llm_subject::scope(&self.reader, ws, Some(proj)).await
+        }
+    }
+
     /// The repository a consolidation of `session_id` would write into, or
     /// `None` when the session has neither observations nor a row.
     ///
@@ -518,24 +776,6 @@ impl Consolidator {
             return Ok(Some(scope));
         }
         Ok(self.reader.session_project_ids(session_id).await?)
-    }
-
-    /// Whether the calling agent wrote the session page through
-    /// `memory_write_page` ([`Wiki::session_page_written_by_agent`]). The
-    /// SessionEnd worker then leaves the page alone instead of replacing it
-    /// with a completion from the server's provider, however many
-    /// observations arrived after it.
-    ///
-    /// # Errors
-    /// Propagates store and wiki errors other than a missing page.
-    pub async fn session_page_written_by_agent(
-        &self,
-        session_id: SessionId,
-    ) -> ConsolidatorResult<bool> {
-        let (ws, proj) = self.resolve_target(session_id).await?;
-        Ok(self
-            .wiki
-            .session_page_written_by_agent(ws, proj, session_id)?)
     }
 
     /// Resolve the session's creating harness from the persisted session row.
@@ -780,10 +1020,41 @@ impl Consolidator {
         instructions: Option<&str>,
     ) -> ConsolidatorResult<Vec<ConsolidationOutcome>> {
         // Resolve the target from where the observations landed — see
-        // `resolve_target` / `consolidate_session` for the rationale. The
-        // bounded reads gate on the session holding at least one
-        // observation in that scope.
+        // `resolve_target` / `consolidate_session` for the rationale — then
+        // consolidate bound to exactly that scope.
         let (ws, proj) = self.resolve_target(session_id).await?;
+        self.consolidate_session_multi_in_scope(
+            ws,
+            proj,
+            session_id,
+            dry_run,
+            actor,
+            author_id,
+            instructions,
+        )
+        .await
+    }
+
+    /// [`Self::consolidate_session_multi`] bound to a caller-supplied scope
+    /// instead of re-resolving it. See [`Self::consolidate_session_in_scope`]
+    /// for why an authorizing caller resolves and authorizes the target once,
+    /// then passes it here (GHSA-xfgc-hc4c-wj7h).
+    ///
+    /// # Errors
+    /// Returns [`ConsolidatorError`] for any store, wiki, or LLM failure. On
+    /// error, no pages are written and no files moved.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn consolidate_session_multi_in_scope(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        dry_run: bool,
+        actor: ai_memory_core::ActorContext,
+        author_id: Option<ai_memory_core::UserId>,
+        instructions: Option<&str>,
+    ) -> ConsolidatorResult<Vec<ConsolidationOutcome>> {
+        let (ws, proj) = (workspace_id, project_id);
 
         // Bounded gate (see `consolidate_session`): count only, no row is
         // materialised; a session with no observations in its consolidation
@@ -848,10 +1119,14 @@ impl Consolidator {
             &existing_titles,
         );
         let cfg = batch_projection_cfg(plan.observation_chars, self.verbatim_residue);
-        let projected = self
+        let projected_and_trust = self
             .reader
             .read_session_observations_in_scope(ws, proj, session_id, move |snap| {
-                Ok(project_session_observations(snap, &cfg)?.map(|(projected, _stats)| projected))
+                let Some((projected, _stats)) = project_session_observations(snap, &cfg)? else {
+                    return Ok(None);
+                };
+                let tool_result_only = snap.sources_are_tool_result_only(&projected.source_ids)?;
+                Ok(Some((projected, tool_result_only)))
             })
             .await
             .map_err(|e| match e {
@@ -860,15 +1135,20 @@ impl Consolidator {
                 StoreError::SessionCollision => ConsolidatorError::EmptySession(session_id),
                 other => other.into(),
             })?;
-        let Some(projected) = projected else {
+        let Some((projected, tool_result_only)) = projected_and_trust else {
             return Err(ConsolidatorError::EmptySession(session_id));
         };
         // One LLM operation, one identity (see `consolidate_session`): the
         // fresh id is shared by every attempt of this invocation; a
         // re-entry after a crash or a new queue claim is a new operation
         // with a new id.
-        let operation_id = LlmOperationId::for_workload(ai_memory_llm::LlmWorkload::Consolidation);
-        let request = assemble_batch_request(&plan, &projected, self.budgets);
+        let operation_id = LlmOperationId::for_workload(ai_memory_llm::LlmWorkload::Consolidation)
+            .with_subject(self.llm_subject(ws, proj, session_id).await);
+        let mut request = assemble_batch_request(&plan, &projected, self.budgets);
+        request.system = Some(crate::with_output_language(
+            BATCH_SYSTEM_PROMPT,
+            self.output_language.as_deref(),
+        ));
         debug!(
             session = %session_id,
             provider = self.llm.name(),
@@ -906,15 +1186,46 @@ impl Consolidator {
                 }
                 Err(e) => return Err(e),
             };
+            // Step 3 (#2164): refuse `_rules/` emission when every supporting
+            // source observation is `tool_result` (no `operator_authored` or
+            // `model_generated` rule backing). Downgrade to `gotchas/` so the
+            // note is still searchable without entering the always-on rule
+            // surface; restating the rule in a `user-prompt` lifts the gate.
+            if tool_result_only
+                && (upd.kind == crate::types::PageKind::Rule
+                    || req.path.as_str().starts_with("_rules/"))
+            {
+                let slug = slugify_for_rule(&outcome.new_title);
+                let downgraded = PagePath::new(format!("gotchas/{slug}.md"))?;
+                warn!(
+                    session = %session_id,
+                    original_path = %req.path.as_str(),
+                    downgraded_path = %downgraded.as_str(),
+                    "refused _rules/ emission from tool_result-only observations; downgraded to gotchas/",
+                );
+                req.path = downgraded.clone();
+                outcome.path = downgraded;
+                if let Some(obj) = req.frontmatter.as_object_mut() {
+                    obj.insert(
+                        "kind".into(),
+                        serde_json::Value::String(crate::types::PageKind::Gotcha.as_str().into()),
+                    );
+                }
+            }
             if req.path == anchor {
                 stamp_session_origin(&mut req.frontmatter, session_id, agent_kind);
                 // Deterministic backstop for the title-uniqueness prompt
                 // rule — see the matching block in `consolidate_session`.
                 disambiguate_anchor_title(&mut req, &mut outcome, &existing_titles, session_id);
             }
+            // Every page of the batch came out of the one prompt, so each
+            // names the observations that prompt carried (#2164).
             req.evidence = vec![ai_memory_core::PageEvidence {
                 kind: ai_memory_core::PageEvidenceKind::Session,
                 source_id: session_id.to_string(),
+                observations: ai_memory_core::SourceObservations::Listed(
+                    projected.source_ids.clone(),
+                ),
             }];
             // A slot the engine writes belongs to the operator whose session
             // produced it, and `build_update` keeps the model's path verbatim
@@ -1214,6 +1525,7 @@ fn build_update(
         author_id,
         actor: actor.clone(),
         evidence: Vec::new(),
+        trust_class: None,
     };
     let outcome = ConsolidationOutcome {
         path,
@@ -1867,7 +2179,7 @@ const CHARS_PER_TOKEN: usize = 3;
 
 /// Approximate chat-envelope overhead not represented by message content or
 /// the structured-output schema itself (roles, separators, provider framing).
-const PROMPT_ENVELOPE_RESERVE_CHARS: usize = 1_024;
+pub(crate) const PROMPT_ENVELOPE_RESERVE_CHARS: usize = 1_024;
 
 /// If JSON-schema serialization unexpectedly fails while sizing a prompt,
 /// consume a conservative part of the budget instead of treating the schema
@@ -2314,9 +2626,17 @@ fn fold_rule_slug(title: &str, digest_fold_loss: bool) -> String {
             out.pop();
         }
     }
-    match suffix {
+    let slug = match suffix {
         Some(suffix) => format!("{out}{suffix}"),
         None => out,
+    };
+    // A device stem (`con`, `nul`, `com1`) fails `ensure_portable`, which
+    // would abort the whole batch; a trailing `-` keeps it a plain name, as
+    // `make_component_portable` does for the non-rule paths.
+    if ai_memory_core::is_dos_device_name(&slug) {
+        format!("{slug}-")
+    } else {
+        slug
     }
 }
 
@@ -2526,6 +2846,30 @@ pub(crate) const SYSTEM_PROMPT: &str = crate::prompt_template::prompt_with_wikil
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_language_override_extends_system_prompt_only_when_set() {
+        assert_eq!(
+            crate::with_output_language(SYSTEM_PROMPT, None),
+            SYSTEM_PROMPT
+        );
+        let out = crate::with_output_language(SYSTEM_PROMPT, Some("English"));
+        assert!(out.starts_with(SYSTEM_PROMPT));
+        assert!(out.contains("OPERATOR OVERRIDE"));
+        assert!(out.contains("in English"));
+    }
+
+    #[test]
+    fn output_language_override_extends_batch_system_prompt_only_when_set() {
+        assert_eq!(
+            crate::with_output_language(BATCH_SYSTEM_PROMPT, None),
+            BATCH_SYSTEM_PROMPT
+        );
+        let out = crate::with_output_language(BATCH_SYSTEM_PROMPT, Some("English"));
+        assert!(out.starts_with(BATCH_SYSTEM_PROMPT));
+        assert!(out.contains("OPERATOR OVERRIDE"));
+        assert!(out.contains("in English"));
+    }
     use ai_memory_core::{ObservationId, ObservationKind, ProjectId, SessionId, WorkspaceId};
     use jiff::Timestamp;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2604,6 +2948,7 @@ mod tests {
             importance: 5,
             extension: None,
             source_event: None,
+            trust_class: ai_memory_core::TrustClass::ModelGenerated,
         }
     }
 
@@ -3432,6 +3777,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::default(),
             evidence: vec![],
+            trust_class: None,
         };
         let mut outcome = ConsolidationOutcome {
             path: colliding.path.clone(),
@@ -3990,6 +4336,20 @@ mod tests {
         assert_eq!(slugify_for_rule("---hyphenated---"), "hyphenated");
     }
 
+    /// A rule titled after a DOS device would land on `_rules/con.md`,
+    /// which `ensure_portable` refuses, and `Wiki::apply_batch` would then
+    /// abort every page in the batch (#848's class, for the rule branch).
+    #[test]
+    fn slugify_keeps_device_name_titles_portable() {
+        for title in ["CON", "nul", "Aux", "COM1", "lpt3"] {
+            let slug = slugify_for_rule(title);
+            let path = PagePath::new(format!("_rules/{slug}.md")).unwrap();
+            assert!(path.ensure_portable().is_ok(), "{title} -> {slug}");
+        }
+        assert_eq!(slugify_for_rule("CON"), "con-");
+        assert_eq!(slugify_for_rule("Console output"), "console-output");
+    }
+
     /// Empty and punctuation-only titles fall back to a static slug
     /// instead of producing an invalid PagePath.
     #[test]
@@ -4422,6 +4782,7 @@ mod tests {
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -5230,9 +5591,180 @@ mod tests {
         );
     }
 
+    /// Captures each structured request's debug form so a test can assert
+    /// what the LLM was shown, and answers a fixed valid page.
+    struct PromptCapturingLlm {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl PromptCapturingLlm {
+        fn new() -> (Self, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            (Self { seen: seen.clone() }, seen)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for PromptCapturingLlm {
+        fn name(&self) -> &'static str {
+            "prompt-capturing"
+        }
+        fn model(&self) -> &str {
+            "prompt-capturing"
+        }
+        async fn complete(
+            &self,
+            _request: ChatRequest,
+        ) -> ai_memory_llm::LlmResult<ai_memory_llm::ChatResponse> {
+            unreachable!("consolidation only uses structured completion");
+        }
+        async fn complete_structured_raw(
+            &self,
+            request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> ai_memory_llm::LlmResult<serde_json::Value> {
+            self.seen.lock().unwrap().push(format!("{request:?}"));
+            Ok(scripted_page())
+        }
+    }
+
+    /// GHSA-xfgc-hc4c-wj7h at the consolidation seam: a session can cross
+    /// repositories mid-flight, holding observations in more than one
+    /// `(workspace_id, project_id)`. `memory_consolidate` resolves and
+    /// authorizes the write target once, then passes it to
+    /// `consolidate_session_in_scope`, which must build and write the page
+    /// strictly in that scope — never re-resolving to another project and
+    /// never pulling another project's observations into the prompt (which a
+    /// concurrent cross-project observation could otherwise cause between the
+    /// grant check and the write). Bites: with the snapshot scope filters
+    /// removed the `must not reach the prompt` assertion fails; if the bound
+    /// scope were ignored and re-resolved, the page would land in the wrong
+    /// project. Binds to each scope in turn, using a consolidator whose own
+    /// startup ids are the *other* project, so the binding cannot come from
+    /// the consolidator's defaults.
+    #[tokio::test]
+    async fn consolidate_in_scope_binds_the_write_and_prompt_to_one_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ai_memory_store::Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let home = store
+            .writer
+            .get_or_create_project(ws, "home", None)
+            .await
+            .unwrap();
+        let restricted = store
+            .writer
+            .get_or_create_project(ws, "restricted", None)
+            .await
+            .unwrap();
+        let session = SessionId::new();
+        // The session row anchors in `home`; a user prompt lands in each
+        // project under the one session id.
+        seed_session(store.db_path(), session, ws, home);
+        let insert = |proj: ProjectId, tag: u8, title: &str, body: &str| {
+            let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+            let mut id = [0u8; 16];
+            id[15] = tag;
+            conn.execute(
+                "INSERT INTO observations \
+                 (id, session_id, workspace_id, project_id, kind, title, body, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, 'user-prompt', ?5, ?6, 1700000000001)",
+                rusqlite::params![
+                    &id[..],
+                    session.as_bytes(),
+                    ws.as_bytes(),
+                    proj.as_bytes(),
+                    title,
+                    body
+                ],
+            )
+            .unwrap();
+        };
+        insert(home, 10, "home prompt", "HOMEBODY alpha");
+        insert(restricted, 20, "restricted prompt", "RESTRICTEDBODY secret");
+
+        let path = PagePath::new(format!("sessions/{session}.md")).unwrap();
+        let path_str = format!("sessions/{session}.md");
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+
+        // Bind to `restricted`, with the consolidator's own startup ids set to
+        // `home`: the page lands in `restricted`, nothing is written into
+        // `home`, and no `home` observation reaches the prompt.
+        let (llm, seen) = PromptCapturingLlm::new();
+        Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            Arc::new(llm),
+            ws,
+            home,
+        )
+        .consolidate_session_in_scope(
+            ws,
+            restricted,
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            wiki.read_page(ws, restricted, &path).is_ok(),
+            "the page lands in the bound scope"
+        );
+        assert!(
+            page_missing(&wiki, ws, home, &path_str),
+            "no page is written into the other scope"
+        );
+        let prompt = seen.lock().unwrap().concat();
+        assert!(
+            prompt.contains("RESTRICTEDBODY"),
+            "the bound scope's own observation is present"
+        );
+        assert!(
+            !prompt.contains("HOMEBODY"),
+            "the other scope's observation must not reach the prompt"
+        );
+
+        // The mirror: bind to `home`, startup ids `restricted`.
+        let (llm2, seen2) = PromptCapturingLlm::new();
+        Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            Arc::new(llm2),
+            ws,
+            restricted,
+        )
+        .consolidate_session_in_scope(
+            ws,
+            home,
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(wiki.read_page(ws, home, &path).is_ok());
+        let prompt2 = seen2.lock().unwrap().concat();
+        assert!(prompt2.contains("HOMEBODY"));
+        assert!(
+            !prompt2.contains("RESTRICTEDBODY"),
+            "binding to home must not pull the restricted observation"
+        );
+    }
+
     /// Gateway compatibility of a fresh operation id: the 36-character
     /// hyphenated UUID v7 form a gateway records in `X-Request-Id`.
-    fn assert_fresh_gateway_form(id: LlmOperationId) {
+    fn assert_fresh_gateway_form(id: &LlmOperationId) {
         let s = id.to_string();
         assert_eq!(s.len(), 36, "the hyphenated wire form is 36 chars: {s}");
         let parsed = uuid::Uuid::parse_str(&s).expect("parses as a UUID");
@@ -5303,8 +5835,8 @@ mod tests {
                 single1[0], single2[0],
                 "two single invocations of one session get distinct operation ids"
             );
-            assert_fresh_gateway_form(single1[0]);
-            assert_fresh_gateway_form(single2[0]);
+            assert_fresh_gateway_form(&single1[0]);
+            assert_fresh_gateway_form(&single2[0]);
             assert_eq!(
                 single1[0].workload(),
                 ai_memory_llm::LlmWorkload::Consolidation
@@ -5373,8 +5905,8 @@ mod tests {
                 multi1[0], multi2[0],
                 "two multi invocations of one session get distinct operation ids"
             );
-            assert_fresh_gateway_form(multi1[0]);
-            assert_fresh_gateway_form(multi2[0]);
+            assert_fresh_gateway_form(&multi1[0]);
+            assert_fresh_gateway_form(&multi2[0]);
             assert_eq!(
                 multi1[0].workload(),
                 ai_memory_llm::LlmWorkload::Consolidation
@@ -5391,6 +5923,59 @@ mod tests {
         }
     }
 
+    /// The request metadata of a consolidation names the scope it reads and
+    /// the session's owner, not the caller: an operator consolidating someone
+    /// else's session still summarises that person's work.
+    #[tokio::test]
+    async fn the_operation_names_the_session_scope_and_its_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ai_memory_store::Store::open(tmp.path()).unwrap();
+        let ws = store.writer.get_or_create_workspace("acme").await.unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "billing-api", None)
+            .await
+            .unwrap();
+        let session = SessionId::new();
+        seed_session(store.db_path(), session, ws, proj);
+        rusqlite::Connection::open(store.db_path())
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET actor_user = 'user:alice' WHERE id = ?1",
+                rusqlite::params![session.as_bytes()],
+            )
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let caller = ai_memory_core::ActorContext {
+            user: Some("root".into()),
+            ..ai_memory_core::ActorContext::default()
+        };
+
+        let (llm, ids) = OpIdCapturingLlm::new(scripted_page());
+        Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki,
+            Arc::new(llm),
+            ws,
+            proj,
+        )
+        .consolidate_session(session, false, caller, None, None)
+        .await
+        .unwrap();
+
+        let ids = ids.lock().unwrap().clone();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(
+            ids[0].subject(),
+            Some(&ai_memory_llm::LlmSubject {
+                workspace: Some("acme".into()),
+                project: Some("billing-api".into()),
+                user: Some("alice".into()),
+            })
+        );
+    }
+
     async fn write_slot(wiki: &Wiki, ws: WorkspaceId, proj: ProjectId, path: &str, body: &str) {
         wiki.write_page(WritePageRequest {
             workspace_id: ws,
@@ -5405,6 +5990,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -5620,6 +6206,181 @@ mod tests {
                 "path {} must cite the batch's session as evidence",
                 outcome.path.as_str()
             );
+        }
+    }
+
+    /// Answers with a fixed structured response and keeps every prompt.
+    struct SourceCapturingLlm {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        response: serde_json::Value,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for SourceCapturingLlm {
+        fn name(&self) -> &'static str {
+            "source-capturing"
+        }
+        fn model(&self) -> &str {
+            "source-capturing"
+        }
+        async fn complete(
+            &self,
+            _request: ChatRequest,
+        ) -> ai_memory_llm::LlmResult<ai_memory_llm::ChatResponse> {
+            unreachable!("consolidation only uses structured completion");
+        }
+        async fn complete_structured_raw(
+            &self,
+            request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> ai_memory_llm::LlmResult<serde_json::Value> {
+            self.seen.lock().unwrap().push(format!("{request:?}"));
+            Ok(self.response.clone())
+        }
+    }
+
+    /// #2164 step 1: a consolidated page names exactly the observations its
+    /// prompt carried. The session is longer than the projection's selection
+    /// cap, so the prompt omits some rows; those must not be listed, and
+    /// every page of a batch lists the same set. Citing the whole session
+    /// instead of `projected.source_ids` fails this test.
+    #[tokio::test]
+    async fn consolidated_pages_name_exactly_the_observations_in_the_prompt() {
+        for multi in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (store, wiki, session, ws, proj) = batch_fixture(tmp.path()).await;
+            // `batch_fixture` seeded one observation; add enough to pass the cap.
+            let extra = MAX_PROJECTED_OBSERVATIONS + 40;
+            {
+                let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+                for n in 0..extra {
+                    conn.execute(
+                        "INSERT INTO observations \
+                         (id, session_id, workspace_id, project_id, kind, title, body, created_at) \
+                         VALUES (?1, ?2, ?3, ?4, 'post-tool-use', 'tool', 'routine output', ?5)",
+                        rusqlite::params![
+                            ai_memory_core::ObservationId::new().as_bytes(),
+                            session.as_bytes(),
+                            ws.as_bytes(),
+                            proj.as_bytes(),
+                            1_700_000_000_001_i64 + i64::try_from(n).unwrap(),
+                        ],
+                    )
+                    .unwrap();
+                }
+            }
+            let session_ids: Vec<String> = {
+                let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+                let mut stmt = conn
+                    .prepare("SELECT id FROM observations WHERE session_id = ?1")
+                    .unwrap();
+                stmt.query_map([session.as_bytes()], |row| row.get::<_, Vec<u8>>(0))
+                    .unwrap()
+                    .map(|id| {
+                        ai_memory_core::ObservationId::from_slice(&id.unwrap())
+                            .unwrap()
+                            .to_string()
+                    })
+                    .collect()
+            };
+            assert_eq!(session_ids.len(), extra + 1);
+
+            let session_path = format!("sessions/{session}.md");
+            let response = if multi {
+                serde_json::json!({
+                    "rationale": "test provenance",
+                    "updates": [
+                        {
+                            "path": session_path,
+                            "tier": "episodic",
+                            "kind": "fact",
+                            "title": "Session narrative",
+                            "body_markdown": "Session body.",
+                            "tags": []
+                        },
+                        {
+                            "path": "concepts/queue.md",
+                            "tier": "semantic",
+                            "kind": "fact",
+                            "title": "Queue",
+                            "body_markdown": "Concept body.",
+                            "tags": []
+                        }
+                    ]
+                })
+            } else {
+                serde_json::json!({
+                    "title": "Queue decision",
+                    "body_markdown": "The queue is bounded.",
+                    "tags": [],
+                })
+            };
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let consolidator = Consolidator::new(
+                store.reader.clone(),
+                store.writer.clone(),
+                wiki.clone(),
+                Arc::new(SourceCapturingLlm {
+                    seen: seen.clone(),
+                    response,
+                }),
+                ws,
+                proj,
+            );
+            let actor = ai_memory_core::ActorContext::anonymous();
+            let paths: Vec<String> = if multi {
+                consolidator
+                    .consolidate_session_multi(session, false, actor, None, None)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|outcome| outcome.path.as_str().to_owned())
+                    .collect()
+            } else {
+                consolidator
+                    .consolidate_session(session, false, actor, None, None)
+                    .await
+                    .unwrap();
+                vec![session_path.clone()]
+            };
+            assert_eq!(paths.len(), if multi { 2 } else { 1 });
+
+            let prompts = seen.lock().unwrap().clone();
+            assert_eq!(prompts.len(), 1, "one prompt compiled the pages");
+            let mut in_prompt: Vec<String> = session_ids
+                .iter()
+                .filter(|id| prompts[0].contains(&format!("id: {id}")))
+                .cloned()
+                .collect();
+            in_prompt.sort();
+            assert_eq!(in_prompt.len(), MAX_PROJECTED_OBSERVATIONS);
+            assert!(in_prompt.len() < session_ids.len(), "the prompt omits rows");
+
+            for path in paths {
+                let read = store
+                    .reader
+                    .page_compiled_sources(
+                        ws,
+                        proj,
+                        path.clone(),
+                        ai_memory_core::OwnerFilter::Any,
+                        0,
+                        ai_memory_store::MAX_COMPILED_SOURCES_PAGE,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut listed: Vec<String> = read
+                    .sources
+                    .iter()
+                    .map(|source| source.observation_id.to_string())
+                    .collect();
+                listed.sort();
+                assert_eq!(
+                    listed, in_prompt,
+                    "{path} (multi = {multi}) lists exactly the prompt's observations"
+                );
+            }
         }
     }
 
@@ -6396,6 +7157,7 @@ mod tests {
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -6433,6 +7195,7 @@ mod tests {
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -6466,6 +7229,7 @@ mod tests {
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -6509,6 +7273,7 @@ mod tests {
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -6603,6 +7368,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -6627,6 +7393,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -6770,6 +7537,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
